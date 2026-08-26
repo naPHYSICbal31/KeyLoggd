@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Keystroke Dynamics Capture Tool</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 1.3rem; }
+  label { display: block; margin: 12px 0 4px; font-weight: 600; }
+  input[type=text] { width: 100%; font-size: 1.1rem; padding: 8px; box-sizing: border-box; }
+  input[type=text].locked { background: #eee; }
+  button { margin-top: 14px; padding: 8px 16px; font-size: 1rem; cursor: pointer; }
+  #status { margin-top: 10px; font-size: 0.95rem; color: #555; }
+  #samplesList { margin-top: 16px; font-size: 0.9rem; }
+  .sample-ok { color: #1a7a1a; }
+  .phrase-display { font-size: 1.2rem; letter-spacing: 1px; background: #f5f5f5; padding: 10px; border-radius: 4px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+
+<h1>Keystroke Dynamics Capture Tool</h1>
+
+<label for="userId">User ID (your name or an ID, no spaces)</label>
+<input type="text" id="userId" placeholder="e.g. alice">
+
+<label>Phrase to type (fixed for everyone in this dataset)</label>
+<div class="phrase-display" id="phraseDisplay"></div>
+
+<label for="typedInput">Type the phrase above exactly, then press Enter</label>
+<input type="text" id="typedInput" autocomplete="off" spellcheck="false">
+
+<div id="status">Samples collected this session: <span id="sampleCount">0</span></div>
+<div id="samplesList"></div>
+
+<button id="downloadBtn">Download all samples as JSON</button>
+<button id="resetBtn">Reset session</button>
+
+<script>
+// ---- config ----
+const PHRASE = "the quick brown fox"; // must match synthetic_data_generator.py PHRASE
+const MIN_SAMPLES_SUGGESTED = 12;
+
+document.getElementById("phraseDisplay").textContent = PHRASE;
+
+// ---- state ----
+let samples = [];      // one entry per completed repetition
+let currentEvents = []; // events for the in-progress repetition
+let sessionStartPerf = null;
+
+const typedInput = document.getElementById("typedInput");
+const userIdInput = document.getElementById("userId");
+const sampleCountEl = document.getElementById("sampleCount");
+const samplesListEl = document.getElementById("samplesList");
+
+function resetCurrentTyping() {
+  currentEvents = [];
+  sessionStartPerf = null;
+  typedInput.value = "";
+}
+
+// record raw keydown/keyup with high-resolution timestamps (seconds, relative
+// to the first keydown of this repetition) -- matches the format expected by
+// signal_construction.py / synthetic_data_generator.py
+typedInput.addEventListener("keydown", (e) => {
+  // ignore modifier-only / non-character control keys we don't care about,
+  // but DO allow Enter through so we can detect submission separately below
+  if (e.key.length !== 1 && e.key !== "Enter" && e.key !== "Backspace") return;
+
+  if (sessionStartPerf === null) sessionStartPerf = performance.now();
+  const t = (performance.now() - sessionStartPerf) / 1000.0;
+
+  if (e.key === "Enter") {
+    e.preventDefault();
+    submitSample();
+    return;
+  }
+  if (e.key === "Backspace") {
+    // simplest handling for a course project: discard progress on backspace
+    // so templates stay clean; force the user to retype the whole phrase
+    resetCurrentTyping();
+    return;
+  }
+
+  currentEvents.push({ key: e.key, type: "down", t: t });
+});
+
+typedInput.addEventListener("keyup", (e) => {
+  if (e.key.length !== 1) return;
+  if (sessionStartPerf === null) return;
+  const t = (performance.now() - sessionStartPerf) / 1000.0;
+  currentEvents.push({ key: e.key, type: "up", t: t });
+});
+
+function submitSample() {
+  const typedText = typedInput.value;
+
+  if (typedText !== PHRASE) {
+    alert("Typed text didn't exactly match the phrase. Please retry.\nExpected: \"" + PHRASE + "\"\nGot: \"" + typedText + "\"");
+    resetCurrentTyping();
+    return;
+  }
+  if (!userIdInput.value.trim()) {
+    alert("Please enter a User ID before recording samples.");
+    resetCurrentTyping();
+    return;
+  }
+
+  samples.push({ events: currentEvents.slice() });
+  sampleCountEl.textContent = samples.length;
+
+  const li = document.createElement("div");
+  li.className = "sample-ok";
+  li.textContent = "✓ Sample " + samples.length + " recorded (" + currentEvents.length + " events)";
+  samplesListEl.prepend(li);
+
+  resetCurrentTyping();
+
+  if (samples.length === MIN_SAMPLES_SUGGESTED) {
+    alert("You've recorded " + MIN_SAMPLES_SUGGESTED + " samples — that's a good minimum. You can keep going or download now.");
+  }
+}
+
+document.getElementById("downloadBtn").addEventListener("click", () => {
+  if (samples.length === 0) {
+    alert("No samples recorded yet.");
+    return;
+  }
+  const userId = userIdInput.value.trim() || "unknown_user";
+  const record = { user_id: userId, phrase: PHRASE, samples: samples };
+
+  const blob = new Blob([JSON.stringify(record, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = userId + ".json";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (!confirm("Clear all recorded samples for this session?")) return;
+  samples = [];
+  sampleCountEl.textContent = "0";
+  samplesListEl.innerHTML = "";
+  resetCurrentTyping();
+});
+</script>
+
+</body>
+</html>
