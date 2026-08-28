@@ -10,6 +10,10 @@ format used by the rest of the project (synthetic_data_generator.py /
 signal_construction.py), so a typing-test "session" here doubles as an
 enrollment or login sample for the biometric pipeline.
 
+Finishing a test swaps the typing area for a results screen: the headline
+stats beside a Monkeytype-style graph of net wpm, per-second raw wpm, and the
+seconds that contained a mistake.
+
 Run:
     python3 typetest_app.py
 
@@ -24,6 +28,7 @@ Tk's weight synthesis.
 """
 
 import json
+import math
 import os
 import random
 import time
@@ -172,6 +177,233 @@ class RoundedPanel(tk.Canvas):
         self.tag_lower("panel")
 
 
+# ---------------------------------------------------------------------------
+# Results graph
+# ---------------------------------------------------------------------------
+
+class WpmChart(tk.Canvas):
+    """The Monkeytype-style results graph, drawn straight onto a Tk canvas.
+
+    Three marks share a single words-per-minute scale, so there is no second
+    axis: the settled line is net wpm as it converges over the run, the jagged
+    line is the raw wpm of each individual second, and an X sits on the raw
+    line wherever that second contained a mistake. The X is a different shape,
+    not merely a different colour, so the error marks survive a colourblind or
+    greyscale read.
+
+    The two series colours are the chart steps checked against this panel
+    surface (the product terracotta stepped into the dark lightness band, plus
+    its warm/cool counterpart); numbers and labels stay in text tokens, with
+    identity carried by the swatch beside each legend label.
+    """
+
+    WPM_COLOUR = "#D2724F"
+    RAW_COLOUR = "#3987E5"
+    ERR_COLOUR = FG_INCORRECT
+    GRID = "#3A3A37"
+
+    PAD_L, PAD_R, PAD_T, PAD_B = 54, 22, 38, 34
+    LINE_WIDTH = 2
+
+    def __init__(self, parent, height=250):
+        super().__init__(parent, bg=BG_PANEL, bd=0, highlightthickness=0,
+                         height=height)
+        self.samples = []
+        self._geom = None
+        self._hover = None
+        self.tick_font = (FONT_MONO, 9, "normal")
+        self.label_font = (FONT_REGULAR, 11, "normal")
+        self.value_font = (FONT_MONO, 11, "normal")
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", self._on_leave)
+
+    def show(self, samples):
+        self.samples = list(samples)
+        self._hover = None
+        self._draw()
+
+    def clear(self):
+        self.samples = []
+        self._hover = None
+        self.delete("all")
+
+    # -- scales ---------------------------------------------------------
+    @staticmethod
+    def _axis_steps(peak, count=5):
+        """A round gridline step, and the smallest multiple of it above `peak`.
+
+        The ceiling is snapped to the step rather than fixed at `count` steps,
+        so a 108 wpm peak tops out at 125 instead of stranding the data in the
+        bottom half of the plot.
+        """
+        peak = max(peak, 1.0)
+        step = 1
+        for candidate in (1, 2, 4, 5, 10, 20, 25, 40, 50, 100, 200, 250, 400, 500, 1000):
+            step = candidate
+            if candidate >= peak / count:
+                break
+        return math.ceil(peak / step) * step, step
+
+    @staticmethod
+    def _time_step(span):
+        for step in (1, 2, 5, 10, 15, 30, 60, 120, 300):
+            if span / step <= 6:
+                return step
+        return 600
+
+    def _px(self, t):
+        x0, _y0, x1, _y1, span, _top = self._geom
+        return x0 + (t / span if span else 0.0) * (x1 - x0)
+
+    def _py(self, value):
+        _x0, y0, _x1, y1, _span, top = self._geom
+        return y1 - (value / top if top else 0.0) * (y1 - y0)
+
+    # -- drawing --------------------------------------------------------
+    def _draw(self):
+        self.delete("all")
+        self._geom = None
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        if len(self.samples) < 2:
+            self.create_text(width / 2, height / 2, text="too short to graph",
+                             fill=FG_DIM, font=self.label_font)
+            return
+
+        x0, y0 = self.PAD_L, self.PAD_T
+        x1, y1 = width - self.PAD_R, height - self.PAD_B
+        if x1 - x0 < 60 or y1 - y0 < 50:
+            return
+
+        span = max(s["t"] for s in self.samples) or 1.0
+        peak = max(max(s["wpm"], s["raw"]) for s in self.samples)
+        top, step = self._axis_steps(peak)
+        self._geom = (x0, y0, x1, y1, span, top)
+
+        self._draw_grid(x0, x1, y1, top, step, span)
+        self._draw_series()
+        self._draw_errors()
+        self._draw_end_label()
+        self._draw_legend(x0)
+
+    def _draw_grid(self, x0, x1, y1, top, step, span):
+        value = 0
+        while value <= top + 1e-9:
+            y = self._py(value)
+            self.create_line(x0, y, x1, y, fill=self.GRID)
+            self.create_text(x0 - 10, y, text=str(int(value)), anchor="e",
+                             fill=FG_DIM, font=self.tick_font)
+            value += step
+
+        t_step = self._time_step(span)
+        mark = t_step
+        while mark < span - t_step * 0.4:
+            self.create_text(self._px(mark), y1 + 8, text=f"{mark:g}",
+                             anchor="n", fill=FG_DIM, font=self.tick_font)
+            mark += t_step
+        self.create_text(x1, y1 + 8, text=f"{span:.0f}s", anchor="ne",
+                         fill=FG_DIM, font=self.tick_font)
+
+    def _draw_series(self):
+        raw_points = []
+        wpm_points = []
+        for sample in self.samples:
+            x = self._px(sample["t"])
+            raw_points.extend((x, self._py(sample["raw"])))
+            wpm_points.extend((x, self._py(sample["wpm"])))
+        for points, colour in ((raw_points, self.RAW_COLOUR),
+                               (wpm_points, self.WPM_COLOUR)):
+            self.create_line(*points, fill=colour, width=self.LINE_WIDTH,
+                             smooth=True, splinesteps=24,
+                             capstyle="round", joinstyle="round")
+
+    def _draw_errors(self):
+        for sample in self.samples:
+            if sample["errors"] <= 0:
+                continue
+            x = self._px(sample["t"])
+            y = self._py(sample["raw"])
+            # a surface-coloured pass first, so the glyph keeps a gap from
+            # whichever line it happens to land on
+            for colour, weight in ((BG_PANEL, self.LINE_WIDTH + 4),
+                                   (self.ERR_COLOUR, 2)):
+                self.create_line(x - 4, y - 4, x + 4, y + 4,
+                                 fill=colour, width=weight, capstyle="round")
+                self.create_line(x - 4, y + 4, x + 4, y - 4,
+                                 fill=colour, width=weight, capstyle="round")
+
+    def _draw_end_label(self):
+        _x0, y0, _x1, _y1, _span, _top = self._geom
+        last = self.samples[-1]
+        x = self._px(last["t"])
+        y = max(y0 + 8, self._py(last["wpm"]) - 12)
+        self.create_text(x - 4, y, text=f"{last['wpm']:.0f}", anchor="se",
+                         fill=FG_TEXT, font=self.value_font)
+
+    def _draw_legend(self, x0):
+        y = self.PAD_T / 2
+        x = x0
+        entries = ((self.WPM_COLOUR, "wpm", False),
+                   (self.RAW_COLOUR, "raw", False),
+                   (self.ERR_COLOUR, "errors", True))
+        for colour, label, is_cross in entries:
+            if is_cross:
+                self.create_line(x + 2, y - 4, x + 12, y + 4, fill=colour, width=2)
+                self.create_line(x + 2, y + 4, x + 12, y - 4, fill=colour, width=2)
+            else:
+                self.create_line(x, y, x + 14, y, fill=colour,
+                                 width=self.LINE_WIDTH, capstyle="round")
+            item = self.create_text(x + 21, y, text=label, anchor="w",
+                                    fill=FG_LABEL, font=self.label_font)
+            x = self.bbox(item)[2] + 18
+
+    # -- hover ----------------------------------------------------------
+    def _on_motion(self, event):
+        if self._geom is None:
+            return
+        x0, y0, x1, y1, span, _top = self._geom
+        if not (x0 - 8 <= event.x <= x1 + 8 and y0 - 12 <= event.y <= y1 + 12):
+            self._on_leave()
+            return
+        t = (event.x - x0) / max(1.0, float(x1 - x0)) * span
+        index = min(range(len(self.samples)),
+                    key=lambda i: abs(self.samples[i]["t"] - t))
+        if index == self._hover:
+            return
+        self._hover = index
+        self._draw_hover()
+
+    def _on_leave(self, _event=None):
+        if self._hover is None:
+            return
+        self._hover = None
+        self.delete("hover")
+
+    def _draw_hover(self):
+        self.delete("hover")
+        if self._hover is None or self._geom is None:
+            return
+        sample = self.samples[self._hover]
+        _x0, y0, x1, y1, _span, _top = self._geom
+        x = self._px(sample["t"])
+        self.create_line(x, y0, x, y1, fill=FG_DIM, tags="hover")
+        for value, colour in ((sample["raw"], self.RAW_COLOUR),
+                              (sample["wpm"], self.WPM_COLOUR)):
+            y = self._py(value)
+            self.create_oval(x - 4, y - 4, x + 4, y + 4, fill=colour,
+                             outline=BG_PANEL, width=2, tags="hover")
+        parts = [f"{sample['t']:.0f}s", f"{sample['wpm']:.0f} wpm",
+                 f"{sample['raw']:.0f} raw"]
+        if sample["errors"]:
+            plural = "" if sample["errors"] == 1 else "s"
+            parts.append(f"{sample['errors']} error{plural}")
+        self.create_text(x1, self.PAD_T / 2, text="   ".join(parts), anchor="e",
+                         fill=FG_TEXT, font=self.value_font, tags="hover")
+
+
 class TypingTestApp:
     def __init__(self, root):
         self.root = root
@@ -191,6 +423,7 @@ class TypingTestApp:
         self.ui_family_bold = FONT_BOLD
         self.small_font = tkfont.Font(family=self.ui_family, size=12, weight="normal")
         self.big_font = tkfont.Font(family=self.ui_family_bold, size=44, weight="normal")
+        self.stat_font = tkfont.Font(family=self.ui_family_bold, size=22, weight="normal")
 
         # --- mode / option state -------------------------------------------------
         self.mode = "time"                # time | words | quote | zen | custom
@@ -216,6 +449,13 @@ class TypingTestApp:
         self.caret_blink_direction = 1
         self.caret_position = None
         self.display_scroll_line = 0
+
+        # per-second samples behind the results graph:
+        # {"t", "wpm" (net, cumulative), "raw" (that second alone), "errors"}
+        self.wpm_history = []
+        self._last_sample_t = 0.0
+        self._last_sample_typed = 0
+        self._last_sample_incorrect = 0
 
         # raw keystroke capture, in the same schema as the rest of the project
         self.raw_events = []     # list of {"key","type","t"}
@@ -282,7 +522,7 @@ class TypingTestApp:
 
         # status readout (countdown / word progress / elapsed) sits at the
         # top-left of the text container, not the window's top-right corner
-        status_row = tk.Frame(mid, bg=BG)
+        self.status_row = status_row = tk.Frame(mid, bg=BG)
         status_row.place(relx=.015, rely=0.38, anchor="sw")
         self.timer_label = tk.Label(status_row, text=f"{self.test_duration}", fg=ACCENT,
                                      bg=BG, font=(self.ui_family_bold, 32, "normal"))
@@ -308,12 +548,18 @@ class TypingTestApp:
 
         # results panel (hidden until a test finishes)
         self.results_frame = tk.Frame(self.root, bg=BG_PANEL)
-        self.wpm_label = tk.Label(self.results_frame, text="", fg=ACCENT, bg=BG_PANEL,
-                                   font=self.big_font)
-        self.wpm_label.pack(pady=(24, 4))
-        self.acc_label = tk.Label(self.results_frame, text="", fg=FG_TEXT, bg=BG_PANEL,
-                                   font=self.small_font)
-        self.acc_label.pack(pady=(0, 16))
+
+        body = tk.Frame(self.results_frame, bg=BG_PANEL)
+        body.pack(fill="both", expand=True, padx=30, pady=(26, 6))
+
+        stats = tk.Frame(body, bg=BG_PANEL)
+        stats.pack(side="left", anchor="center", padx=(0, 28))
+        self.wpm_label = self._stat_block(stats, "wpm", self.big_font, ACCENT)
+        self.acc_label = self._stat_block(stats, "accuracy", self.stat_font, FG_TEXT)
+        self.chars_label = self._stat_block(stats, "characters", self.stat_font, FG_TEXT)
+
+        self.chart = WpmChart(body, height=250)
+        self.chart.pack(side="left", fill="both", expand=True)
 
         btn_row = tk.Frame(self.results_frame, bg=BG_PANEL)
         btn_row.pack(pady=(0, 20))
@@ -346,6 +592,14 @@ class TypingTestApp:
         self.root.bind_all("<Motion>", self._on_mouse_motion)
 
         self._refresh_mode_styles()
+
+    def _stat_block(self, parent, caption, font, colour):
+        """One caption-over-value stat in the results column."""
+        tk.Label(parent, text=caption, fg=FG_LABEL, bg=BG_PANEL,
+                 font=self.small_font).pack(anchor="w")
+        value = tk.Label(parent, text="", fg=colour, bg=BG_PANEL, font=font)
+        value.pack(anchor="w", pady=(0, 14))
+        return value
 
     def _set_typing_focus_mode(self, active):
         if active:
@@ -539,6 +793,10 @@ class TypingTestApp:
         self.raw_events = []
         self.session_perf0 = None
         self.display_scroll_line = 0
+        self.wpm_history = []
+        self._last_sample_t = 0.0
+        self._last_sample_typed = 0
+        self._last_sample_incorrect = 0
         self.caret_position = None
         self.caret_visible = True
         self.caret_blink_level = 0
@@ -569,6 +827,8 @@ class TypingTestApp:
             self.full_text = " ".join(self.words)
 
         self.results_frame.place_forget()
+        self.chart.clear()
+        self.status_row.place(relx=.015, rely=0.38, anchor="sw")
         self.text.place(relx=0.5, rely=0.5, anchor="center", relwidth=1.0)
 
         self.text.config(state="normal")
@@ -693,6 +953,7 @@ class TypingTestApp:
         if self.state != "running":
             return
         elapsed = time.perf_counter() - self.start_perf
+        self._flush_samples(elapsed)
 
         if self.mode == "time":
             remaining = max(0, self.test_duration - elapsed)
@@ -716,6 +977,35 @@ class TypingTestApp:
         if self.mode == "zen" and self.state == "running":
             self._finish_test(user_stopped=True)
 
+    def _flush_samples(self, elapsed, final=False):
+        """Close out every whole second that has passed since the last sample.
+
+        Sampling on second boundaries is what makes the raw series meaningful:
+        each point is the speed of that one second, so it stays jagged, while
+        the net series is cumulative and settles as the run goes on. A final
+        partial second is only kept if it is long enough not to read as a
+        spike.
+        """
+        while elapsed - self._last_sample_t >= 1.0:
+            self._record_sample(self._last_sample_t + 1.0)
+        if final and elapsed - self._last_sample_t >= 0.35:
+            self._record_sample(elapsed)
+
+    def _record_sample(self, t):
+        window = t - self._last_sample_t
+        if window <= 0:
+            return
+        typed = self.typed_correct + self.typed_incorrect
+        self.wpm_history.append({
+            "t": t,
+            "wpm": (self.typed_correct / 5.0) / (t / 60.0),
+            "raw": ((typed - self._last_sample_typed) / 5.0) / (window / 60.0),
+            "errors": self.typed_incorrect - self._last_sample_incorrect,
+        })
+        self._last_sample_t = t
+        self._last_sample_typed = typed
+        self._last_sample_incorrect = self.typed_incorrect
+
     def _finish_test(self, user_stopped=False):
         if self.state != "running" and not user_stopped:
             return
@@ -725,16 +1015,23 @@ class TypingTestApp:
             self.root.after_cancel(self.timer_job)
             self.timer_job = None
 
-        elapsed_minutes = max(1e-6, (time.perf_counter() - (self.start_perf or time.perf_counter())) / 60.0)
+        elapsed = time.perf_counter() - (self.start_perf or time.perf_counter())
+        self._flush_samples(elapsed, final=True)
+
+        elapsed_minutes = max(1e-6, elapsed / 60.0)
         total_typed = self.typed_correct + self.typed_incorrect
         wpm = (self.typed_correct / 5.0) / elapsed_minutes
         accuracy = (self.typed_correct / total_typed * 100.0) if total_typed else 0.0
 
         self.text.place_forget()
-        self.wpm_label.config(text=f"{wpm:.0f} wpm")
-        self.acc_label.config(text=f"{accuracy:.1f}% accuracy   |   {total_typed} chars typed")
+        # the countdown would otherwise show through the widened results panel
+        self.status_row.place_forget()
+        self.wpm_label.config(text=f"{wpm:.0f}")
+        self.acc_label.config(text=f"{accuracy:.1f}%")
+        self.chars_label.config(text=str(total_typed))
+        self.chart.show(self.wpm_history)
         self.results_frame.place(relx=0.5, rely=0.5, anchor="center",
-                     relwidth=0.8, relheight=0.6)
+                     relwidth=0.92, relheight=0.78)
 
     # ------------------------------------------------------------------
     # Keystroke handling (drives both the typing test AND raw capture)
