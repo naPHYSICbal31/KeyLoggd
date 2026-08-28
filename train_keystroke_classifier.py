@@ -79,7 +79,6 @@ REQUIREMENTS
 
 import argparse
 import bisect
-import contextlib
 import glob
 import json
 import os
@@ -1264,23 +1263,22 @@ class AnnotatorApp:
         threading.Thread(target=self._train_worker, daemon=True).start()
 
     def _train_worker(self):
-        # train() speaks through print(); pipe those lines to the status line
-        # so the run shows progress instead of a frozen spinner.
-        class _Pipe:
-            def __init__(self, put):
-                self.put = put
-
-            def write(self, text):
-                line = text.strip()
-                if line:
-                    self.put(("train_log", line))
-
-            def flush(self):
-                pass
+        # train() reports progress through its `log` callback, which is piped
+        # to the status line. Redirecting sys.stdout would have been the lazy
+        # way, but that is process-global rather than per-thread: it would
+        # swallow output from every other thread for the length of the run.
+        def log(msg):
+            line = " ".join(str(msg).split())
+            # The confusion matrix is a multi-line table; its rows belong in a
+            # terminal, not squeezed into a one-line status label. They are
+            # the only output with no letters in them at all, which
+            # distinguishes them from the [warn] lines worth showing.
+            if not line or not any(c.isalpha() for c in line):
+                return
+            self.results.put(("train_log", line[:120]))
 
         try:
-            with contextlib.redirect_stdout(_Pipe(self.results.put)):
-                train(self.data_dir, self.model_path, sr=self.sr)
+            train(self.data_dir, self.model_path, sr=self.sr, log=log)
             self.results.put(("train_done", self.model_path))
         except Exception as exc:
             self.results.put(("train_error", exc))
@@ -1499,23 +1497,54 @@ def extract_keystroke_segment(y, sr, pre_ms=20, post_ms=180, top_db=30):
     return segment
 
 
-def extract_features(y, sr, n_mfcc=20):
+def _safe_delta(x, width=9):
+    """librosa.feature.delta, clamped to the frames actually available.
+
+    The default width of 9 frames exceeds what a short clip produces, and
+    librosa raises rather than adapting - which, wrapped in build_dataset's
+    per-file try/except, turns into every clip being skipped. Width must
+    stay odd and >= 3; below that there is nothing to differentiate and a
+    zero delta block keeps the feature vector the same length either way.
+    """
+    import librosa
+
+    frames = x.shape[-1]
+    usable = min(width, frames if frames % 2 else frames - 1)
+    if usable < 3:
+        return np.zeros_like(x)
+    return librosa.feature.delta(x, width=usable)
+
+
+def extract_features(y, sr, n_mfcc=20, n_fft=512, hop_length=128):
     """
     Extract a fixed-length feature vector combining MFCCs (timbre),
     spectral centroid/bandwidth/rolloff (brightness/shape), zero-crossing
     rate (percussiveness), and RMS energy envelope stats - all useful for
     telling apart the short, percussive clicks of different keys.
+
+    The window defaults are sized for keystrokes, not for music: a click is
+    ~200ms end to end, so librosa's default 2048-sample window (128ms at
+    16kHz) would smear the whole transient into about seven frames. A
+    32ms window hopped every 8ms resolves the press and release instead,
+    and gives the delta filter enough frames to run at all.
     """
     import librosa
 
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-    mfcc_delta = librosa.feature.delta(mfcc)
+    # A clip shorter than one window would otherwise be zero-padded to a
+    # single frame; shrink the window to fit instead.
+    if len(y):
+        n_fft = min(n_fft, len(y))
+    kw = {"n_fft": n_fft, "hop_length": hop_length}
 
-    spec_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
-    spec_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)
-    spec_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
-    zcr = librosa.feature.zero_crossing_rate(y)
-    rms = librosa.feature.rms(y=y)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc, **kw)
+    mfcc_delta = _safe_delta(mfcc)
+
+    spec_centroid = librosa.feature.spectral_centroid(y=y, sr=sr, **kw)
+    spec_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr, **kw)
+    spec_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, **kw)
+    zcr = librosa.feature.zero_crossing_rate(y, frame_length=n_fft,
+                                             hop_length=hop_length)
+    rms = librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop_length)
 
     def stats(x):
         return np.concatenate([x.mean(axis=1), x.std(axis=1)])
@@ -1536,7 +1565,7 @@ def extract_features(y, sr, n_mfcc=20):
 # Dataset loading
 # --------------------------------------------------------------------------
 
-def build_dataset(data_dir, sr=DEFAULT_SR, auto_segment=True):
+def build_dataset(data_dir, sr=DEFAULT_SR, auto_segment=True, log=print):
     # Underscore-prefixed folders are the annotator's bookkeeping
     # (_sessions, _rejected), not keys.
     labels = sorted([
@@ -1547,13 +1576,18 @@ def build_dataset(data_dir, sr=DEFAULT_SR, auto_segment=True):
         raise ValueError(f"No label sub-folders found in {data_dir}")
 
     X, y_labels = [], []
+    # Per-file failures are tallied by reason: when they are systematic (a
+    # bad feature setting, a missing codec) every single file fails the same
+    # way, and the reason is what the caller needs to be told - not a
+    # thousand scrolled-past [skip] lines and a blank "nothing loaded".
+    skipped = {}
     for label in labels:
         files = glob.glob(os.path.join(data_dir, label, "*.wav"))
         files += glob.glob(os.path.join(data_dir, label, "*.mp3"))
         if not files:
-            print(f"  [warn] no audio files found for label '{label}'")
+            log(f"  [warn] no audio files found for label '{label}'")
             continue
-        print(f"  loading '{label}': {len(files)} files")
+        log(f"  loading '{label}': {len(files)} files")
         for f in files:
             try:
                 audio, sr_ = load_audio(f, sr=sr)
@@ -1563,10 +1597,24 @@ def build_dataset(data_dir, sr=DEFAULT_SR, auto_segment=True):
                 X.append(feats)
                 y_labels.append(label)
             except Exception as e:
-                print(f"    [skip] {f}: {e}")
+                reason = f"{type(e).__name__}: {e}"
+                skipped[reason] = skipped.get(reason, 0) + 1
+                log(f"    [skip] {f}: {e}")
+
+    if skipped:
+        total = sum(skipped.values())
+        log(f"  [warn] skipped {total} unreadable file(s):")
+        for reason, count in sorted(skipped.items(), key=lambda kv: -kv[1]):
+            log(f"    {count} x {reason}")
 
     if not X:
-        raise ValueError("No usable audio was loaded. Check your dataset directory.")
+        detail = ""
+        if skipped:
+            worst, count = max(skipped.items(), key=lambda kv: kv[1])
+            detail = (f" All {sum(skipped.values())} file(s) failed; most "
+                      f"common reason ({count}x): {worst}")
+        raise ValueError(
+            f"No usable audio was loaded from {data_dir}.{detail}")
 
     return np.array(X), np.array(y_labels)
 
@@ -1575,16 +1623,17 @@ def build_dataset(data_dir, sr=DEFAULT_SR, auto_segment=True):
 # Training
 # --------------------------------------------------------------------------
 
-def train(data_dir, model_out, sr=DEFAULT_SR, min_per_class=2):
+def train(data_dir, model_out, sr=DEFAULT_SR, min_per_class=2, log=print):
     from sklearn.model_selection import train_test_split
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler, LabelEncoder
     from sklearn.metrics import classification_report, confusion_matrix
     import joblib
 
-    print(f"Building dataset from {data_dir} ...")
-    X, y_labels = build_dataset(data_dir, sr=sr)
-    print(f"Total examples: {len(X)}, classes: {sorted(set(y_labels))}")
+    log(f"Building dataset from {data_dir} ...")
+    X, y_labels = build_dataset(data_dir, sr=sr, log=log)
+    log(f"Total examples: {len(X)}, classes: "
+        f"{' '.join(sorted(str(l) for l in set(y_labels)))}")
 
     # A stratified split needs >= 2 examples in every class, so keys with too
     # few clips are dropped here rather than crashing the split. Collecting
@@ -1596,31 +1645,47 @@ def train(data_dir, model_out, sr=DEFAULT_SR, min_per_class=2):
     thin = sorted(l for l, c in counts.items() if c < min_per_class)
     if thin:
         for label in thin:
-            print(f"  skipping '{label}' ({counts[label]} clip"
+            log(f"  skipping '{label}' ({counts[label]} clip"
                   f"{'s' if counts[label] != 1 else ''}, "
                   f"need >={min_per_class})")
         keep = np.array([counts[l] >= min_per_class for l in y_labels])
         X, y_labels = X[keep], y_labels[keep]
 
-    usable = sorted(set(y_labels))
+    usable = sorted(str(l) for l in set(y_labels))
     if len(usable) < 2:
         raise ValueError(
             f"need at least 2 keys with >={min_per_class} clips each to train; "
             f"only have {usable or 'none'}. Collect more in the annotator.")
-    print(f"Training on {len(X)} clips across {len(usable)} keys: {usable}")
+    log(f"Training on {len(X)} clips across {len(usable)} keys: "
+          f"{' '.join(usable)}")
 
     encoder = LabelEncoder()
     y = encoder.fit_transform(y_labels)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # A stratified split needs at least one clip per key on BOTH sides, so a
+    # 20% test slice is not usable until there are ~5 clips per key. Size the
+    # slice off the class count rather than the ratio, and if even that does
+    # not fit, train on everything and say plainly that the model came with
+    # no held-out evaluation - a usable model beats a refusal to build one.
+    n_classes = len(usable)
+    test_size = max(int(round(0.2 * len(X))), n_classes)
+    if len(X) - test_size < n_classes:
+        test_size = len(X) - n_classes
+
+    if test_size >= n_classes and len(X) - test_size >= n_classes:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=y
+        )
+    else:
+        log(f"  [warn] only {len(X)} clips for {n_classes} keys - too few "
+              "to hold out a test set. Training on all of them; the accuracy "
+              "below is unmeasured. Collect more clips per key.")
+        X_train, y_train, X_test, y_test = X, y, None, None
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
 
-    print("Training RandomForestClassifier ...")
+    log("Training RandomForestClassifier ...")
     clf = RandomForestClassifier(
         n_estimators=300,
         max_depth=None,
@@ -1629,11 +1694,18 @@ def train(data_dir, model_out, sr=DEFAULT_SR, min_per_class=2):
     )
     clf.fit(X_train_scaled, y_train)
 
-    y_pred = clf.predict(X_test_scaled)
-    print("\nClassification report:")
-    print(classification_report(y_test, y_pred, target_names=encoder.classes_))
-    print("Confusion matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    if X_test is not None:
+        y_pred = clf.predict(scaler.transform(X_test))
+        seen = sorted(set(y_test) | set(y_pred))
+        log("\nClassification report:")
+        log(classification_report(
+            y_test, y_pred, labels=seen,
+            target_names=[str(encoder.classes_[i]) for i in seen],
+            zero_division=0))
+        log("Confusion matrix:")
+        log(confusion_matrix(y_test, y_pred))
+    else:
+        log("\n(no held-out test set - skipping the accuracy report)")
 
     bundle = {
         "model": clf,
@@ -1642,7 +1714,7 @@ def train(data_dir, model_out, sr=DEFAULT_SR, min_per_class=2):
         "sample_rate": sr,
     }
     joblib.dump(bundle, model_out)
-    print(f"\nSaved model to {model_out}")
+    log(f"\nSaved model to {model_out}")
 
 
 # --------------------------------------------------------------------------
