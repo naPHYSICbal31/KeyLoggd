@@ -79,6 +79,7 @@ REQUIREMENTS
 
 import argparse
 import bisect
+import contextlib
 import glob
 import json
 import os
@@ -957,7 +958,8 @@ class AnnotatorApp:
     """
 
     def __init__(self, root, data_dir=DEFAULT_DATA_DIR, params=None,
-                 target=DEFAULT_TARGET, sr=DEFAULT_SR, device=None):
+                 target=DEFAULT_TARGET, sr=DEFAULT_SR, device=None,
+                 model_path="keystroke_model.joblib"):
         self.root = root
         init_fonts(root)
 
@@ -971,9 +973,12 @@ class AnnotatorApp:
         self.target = target
         self.sr = sr
         self.device = device
+        # Default next to the cwd so `--infer` auto-loads whatever we train.
+        self.model_path = os.path.abspath(model_path)
 
         self.recorder = None
         self.recording = False
+        self.training = False
         self.pending = {}          # labels typed this session, not yet saved
         self.typed_chars = 0
         self.results = queue.Queue()
@@ -1112,6 +1117,16 @@ class AnnotatorApp:
                                       text=f"target {self.target} clips per key")
         self.coverage_note.pack(side="left", padx=(10, 0))
 
+        # Training closes the loop right here: collect, then train the model on
+        # what is on disk. The result is the .joblib the inference tool loads.
+        self.train_btn = PillButton(head, "train model", self._start_training,
+                                    kind="primary", size=10, bg=BG,
+                                    padx=14, pady=6)
+        self.train_btn.pack(side="right")
+        self.model_note = tk.Label(head, bg=BG, fg=FG_DIM, font=mono(9),
+                                   text=f"-> {os.path.basename(self.model_path)}")
+        self.model_note.pack(side="right", padx=(0, 10))
+
         panel = RoundedPanel(wrap, BG_PANEL, radius=12, padding=12, bg=BG)
         panel.pack(anchor="w")
         self.coverage = CoverageGrid(panel.inner, target=self.target,
@@ -1157,6 +1172,9 @@ class AnnotatorApp:
 
     def _start_recording(self):
         if self.recording:
+            return
+        if self.training:
+            self._status("wait for training to finish before recording", WARN)
             return
         self.recorder = SessionRecorder(sr=self.sr, device=self.device)
         try:
@@ -1211,12 +1229,93 @@ class AnnotatorApp:
         except Exception as exc:                            # pragma: no cover
             self.results.put(("error", exc))
 
+    # -- training -----------------------------------------------------------
+
+    def _start_training(self):
+        if self.training:
+            return
+        if self.recording:
+            self._status("stop recording before training", WARN)
+            return
+
+        for mod in ("librosa", "sklearn", "joblib"):
+            try:
+                __import__(mod)
+            except Exception:
+                self._status("training needs librosa + scikit-learn - "
+                             "pip install librosa scikit-learn joblib", WARN)
+                return
+
+        counts = dataset_counts(self.data_dir)
+        usable = sorted(l for l, c in counts.items() if c >= 2)
+        if len(usable) < 2:
+            have = sum(counts.values())
+            self._status(f"not enough data to train yet - {have} clips, but "
+                         "need >=2 keys with >=2 clips each. keep typing.", WARN)
+            return
+
+        self.training = True
+        self.train_btn.set_enabled(False)
+        self.record_btn.set_enabled(False)
+        self.spinner.start(side="left")
+        total = sum(counts[l] for l in usable)
+        self._status(f"training on {total} clips across {len(usable)} keys - "
+                     "this can take a moment...", ACCENT)
+        threading.Thread(target=self._train_worker, daemon=True).start()
+
+    def _train_worker(self):
+        # train() speaks through print(); pipe those lines to the status line
+        # so the run shows progress instead of a frozen spinner.
+        class _Pipe:
+            def __init__(self, put):
+                self.put = put
+
+            def write(self, text):
+                line = text.strip()
+                if line:
+                    self.put(("train_log", line))
+
+            def flush(self):
+                pass
+
+        try:
+            with contextlib.redirect_stdout(_Pipe(self.results.put)):
+                train(self.data_dir, self.model_path, sr=self.sr)
+            self.results.put(("train_done", self.model_path))
+        except Exception as exc:
+            self.results.put(("train_error", exc))
+
     def _drain_results(self):
         while True:
             try:
                 kind, payload = self.results.get_nowait()
             except queue.Empty:
                 break
+
+            # Training streams many log lines before it finishes; only the
+            # terminal messages release the spinner and the controls.
+            if kind == "train_log":
+                self._status(payload, FG_LABEL)
+                continue
+            if kind == "train_done":
+                self.training = False
+                self.spinner.stop()
+                self.train_btn.set_enabled(True)
+                self.record_btn.set_enabled(SessionRecorder.available())
+                self._refresh_coverage()
+                self._status(
+                    f"model saved to {os.path.basename(payload)} - load it in "
+                    "the inference platform (--infer)", OK)
+                continue
+            if kind == "train_error":
+                self.training = False
+                self.spinner.stop()
+                self.train_btn.set_enabled(True)
+                self.record_btn.set_enabled(SessionRecorder.available())
+                self._status(f"training failed: {payload}", FG_INCORRECT)
+                continue
+
+            # Segmenting a recording (the ("ok"|"error") path).
             self.spinner.stop()
             self.record_btn.set_enabled(SessionRecorder.available())
             if kind == "error":
@@ -1339,7 +1438,8 @@ class AnnotatorApp:
 
 
 def launch_annotator(data_dir=DEFAULT_DATA_DIR, params=None,
-                     target=DEFAULT_TARGET, sr=DEFAULT_SR, device=None):
+                     target=DEFAULT_TARGET, sr=DEFAULT_SR, device=None,
+                     model_path="keystroke_model.joblib"):
     """Open the annotation platform."""
     if _THEME_ERROR is not None:
         sys.exit("The annotation UI needs this project's theme.py and anim.py "
@@ -1347,7 +1447,7 @@ def launch_annotator(data_dir=DEFAULT_DATA_DIR, params=None,
     os.makedirs(data_dir, exist_ok=True)
     root = tk.Tk()
     AnnotatorApp(root, data_dir=data_dir, params=params, target=target,
-                 sr=sr, device=device)
+                 sr=sr, device=device, model_path=model_path)
     root.mainloop()
 
 
@@ -1475,7 +1575,7 @@ def build_dataset(data_dir, sr=DEFAULT_SR, auto_segment=True):
 # Training
 # --------------------------------------------------------------------------
 
-def train(data_dir, model_out, sr=DEFAULT_SR):
+def train(data_dir, model_out, sr=DEFAULT_SR, min_per_class=2):
     from sklearn.model_selection import train_test_split
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -1485,6 +1585,29 @@ def train(data_dir, model_out, sr=DEFAULT_SR):
     print(f"Building dataset from {data_dir} ...")
     X, y_labels = build_dataset(data_dir, sr=sr)
     print(f"Total examples: {len(X)}, classes: {sorted(set(y_labels))}")
+
+    # A stratified split needs >= 2 examples in every class, so keys with too
+    # few clips are dropped here rather than crashing the split. Collecting
+    # more of them in the annotator is the fix; this just keeps the rest
+    # trainable in the meantime.
+    counts = {}
+    for label in y_labels:
+        counts[label] = counts.get(label, 0) + 1
+    thin = sorted(l for l, c in counts.items() if c < min_per_class)
+    if thin:
+        for label in thin:
+            print(f"  skipping '{label}' ({counts[label]} clip"
+                  f"{'s' if counts[label] != 1 else ''}, "
+                  f"need >={min_per_class})")
+        keep = np.array([counts[l] >= min_per_class for l in y_labels])
+        X, y_labels = X[keep], y_labels[keep]
+
+    usable = sorted(set(y_labels))
+    if len(usable) < 2:
+        raise ValueError(
+            f"need at least 2 keys with >={min_per_class} clips each to train; "
+            f"only have {usable or 'none'}. Collect more in the annotator.")
+    print(f"Training on {len(X)} clips across {len(usable)} keys: {usable}")
 
     encoder = LabelEncoder()
     y = encoder.fit_transform(y_labels)
@@ -2280,7 +2403,7 @@ def main(argv=None):
         train(data_dir, args.model_out, sr=args.sr)
     else:
         launch_annotator(data_dir, params=params, target=args.target,
-                         sr=args.sr, device=device)
+                         sr=args.sr, device=device, model_path=args.model_out)
 
 
 if __name__ == "__main__":
