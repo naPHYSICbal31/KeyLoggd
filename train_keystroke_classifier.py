@@ -15,6 +15,8 @@ So nobody hand-labels clips: the keyboard labels itself as you type.
 
     python train_keystroke_classifier.py                 # annotation platform
     python train_keystroke_classifier.py --train --data_dir ./dataset
+    python train_keystroke_classifier.py --infer         # inference platform
+    python train_keystroke_classifier.py --infer_file recording.wav
     python train_keystroke_classifier.py --predict clip.wav
 
 HOW THE ALIGNMENT WORKS
@@ -1552,6 +1554,668 @@ def predict(clip_path, model_path):
 
 
 # --------------------------------------------------------------------------
+# Inference platform - read typing back from sound alone
+# --------------------------------------------------------------------------
+#
+# The annotator has the keyboard tell it where every click is. Inference gets
+# no such help: it is handed only audio and has to find the keystrokes itself,
+# classify each with the trained model, and reconstruct what was typed. When
+# the operator also types the real text (scoring mode) the two are lined up so
+# the attack's accuracy can be read off directly.
+
+# Best-guess character each label stands for, for reconstructing readable
+# text. Physical-key labels (e.g. "semicolon") map back to their character;
+# backspace is handled by reconstruct_text rather than printed.
+LABEL_TO_CHAR = {c: c for c in string.ascii_lowercase}
+LABEL_TO_CHAR.update({d: d for d in "0123456789"})
+LABEL_TO_CHAR.update({
+    "space": " ", "enter": "\n", "tab": "\t",
+    "minus": "-", "equal": "=", "bracketleft": "[", "bracketright": "]",
+    "backslash": "\\", "semicolon": ";", "apostrophe": "'", "grave": "`",
+    "comma": ",", "period": ".", "slash": "/",
+})
+LABEL_TO_CHAR.update({f"kp_{d}": d for d in "0123456789"})
+
+
+def label_to_char(label):
+    """Readable character for a predicted label, bracketed if it has none."""
+    if label in LABEL_TO_CHAR:
+        return LABEL_TO_CHAR[label]
+    return label if len(label) == 1 else f"[{label}]"
+
+
+def reconstruct_text(predictions):
+    """Stitch a predicted key sequence back into text.
+
+    A predicted backspace deletes the previous character, the way it would
+    have while typing, so the reconstruction reads as the finished line
+    rather than as a raw key log.
+    """
+    out = []
+    for pred in predictions:
+        label = pred["label"]
+        if label == "backspace":
+            if out:
+                out.pop()
+            continue
+        out.append(label_to_char(label))
+    return "".join(out)
+
+
+def load_bundle(model_path):
+    """Load a trained model bundle, with a clear message if deps are absent."""
+    try:
+        import joblib
+    except Exception as exc:
+        raise RuntimeError(
+            "inference needs joblib + scikit-learn:\n"
+            "    pip install scikit-learn joblib") from exc
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"no model at {model_path} - train one first")
+    return joblib.load(model_path)
+
+
+def detect_onsets(audio, sr, floor=None, mult=4.0, min_gap_ms=70.0,
+                  smooth_ms=1.0):
+    """Find keystroke clicks in continuous audio (numpy only).
+
+    A click is a sharp rise in the smoothed envelope above the room-noise
+    floor. Each detection claims a refractory window of `min_gap_ms`, which
+    both prevents a single click registering twice and sets the closest two
+    keystrokes that can be told apart - the same limit the annotator uses to
+    call overlaps.
+    """
+    n = len(audio)
+    if n == 0:
+        return []
+    floor = noise_floor(audio, sr) if floor is None else floor
+    threshold = floor * mult
+
+    env = np.abs(audio)
+    smooth = max(1, int(sr * smooth_ms / 1000.0))
+    if smooth > 1 and n > smooth * 2:
+        env = np.convolve(env, np.ones(smooth) / smooth, mode="same")
+
+    gap = max(1, int(sr * min_gap_ms / 1000.0))
+    onsets = []
+    i = 0
+    while i < n:
+        if env[i] > threshold:
+            hi = min(n, i + gap)
+            peak = i + int(np.argmax(env[i:hi]))
+            onsets.append(peak)
+            i = peak + gap                 # refractory: skip this click's tail
+        else:
+            i += 1
+    return onsets
+
+
+def _crop_window(audio, onset, sr, params):
+    """Fixed-length clip around an onset, matching the annotator's windows."""
+    pre = int(sr * params.pre_ms / 1000.0)
+    post = int(sr * params.post_ms / 1000.0)
+    start = max(0, int(onset) - pre)
+    end = min(len(audio), int(onset) + post)
+    seg = audio[start:end]
+    target = pre + post
+    if len(seg) < target:
+        seg = np.pad(seg, (0, target - len(seg)))
+    return seg[:target]
+
+
+def classify_clip(clip, sr, bundle, feature_fn=None):
+    """Classify one clip; return (label, top5, confidence).
+
+    `feature_fn` defaults to the same extract_features used in training, and
+    is injectable so the pipeline can be exercised without librosa.
+    """
+    feature_fn = feature_fn or extract_features
+    clf = bundle["model"]
+    scaler = bundle.get("scaler")
+    encoder = bundle["label_encoder"]
+
+    feats = np.asarray(feature_fn(clip, sr), dtype=float).reshape(1, -1)
+    if scaler is not None:
+        feats = scaler.transform(feats)
+    proba = np.asarray(clf.predict_proba(feats)[0], dtype=float)
+    order = np.argsort(proba)[::-1]
+    classes = encoder.classes_
+    top = [(str(classes[j]), float(proba[j])) for j in order[:5]]
+    return top[0][0], top, float(proba[order[0]])
+
+
+def infer_audio(audio, sr, bundle, params=None, detect_mult=4.0,
+                min_gap_ms=None, feature_fn=None):
+    """Detect, crop and classify every keystroke in a recording.
+
+    Returns one dict per detected click: its position (`onset_sample`, `t`
+    seconds), the predicted `label`, its `confidence`, and the `top` five
+    candidates.
+    """
+    params = params or SegmentParams()
+    gap = params.min_gap_ms if min_gap_ms is None else min_gap_ms
+    onsets = detect_onsets(audio, sr, mult=detect_mult, min_gap_ms=gap)
+
+    preds = []
+    for i, peak in enumerate(onsets):
+        # Re-use the training-time walk-back so the clip handed to the model
+        # is framed exactly as its training clips were.
+        onset, _, _ = refine_onset(audio, sr, peak, params)
+        clip = _crop_window(audio, onset, sr, params)
+        label, top, conf = classify_clip(clip, sr, bundle, feature_fn)
+        preds.append({
+            "index": i,
+            "onset_sample": int(onset),
+            "t": int(onset) / float(sr) if sr else 0.0,
+            "label": label,
+            "confidence": conf,
+            "top": top,
+        })
+    return preds
+
+
+def score_predictions(predictions, events, sr, tolerance_ms=70.0):
+    """Line predictions up against what was actually typed and score them.
+
+    Each true keypress claims the nearest still-unclaimed prediction within
+    `tolerance_ms`; a claimed one is correct when its label matches. Reports
+    accuracy plus the ways it can go wrong: missed keys (no detection near a
+    real press) and spurious ones (a detection near no real press).
+    """
+    tol = tolerance_ms / 1000.0
+    truths = [e for e in events if e.get("label")]
+    claimed = [False] * len(predictions)
+    matched = []
+    correct = 0
+    for ev in truths:
+        best, best_d = -1, tol + 1.0
+        for j, pred in enumerate(predictions):
+            if claimed[j]:
+                continue
+            d = abs(pred["t"] - ev["t"])
+            if d < best_d:
+                best, best_d = j, d
+        if best >= 0 and best_d <= tol:
+            claimed[best] = True
+            ok = predictions[best]["label"] == ev["label"]
+            correct += int(ok)
+            matched.append({"true": ev["label"],
+                            "pred": predictions[best]["label"],
+                            "ok": ok,
+                            "confidence": predictions[best]["confidence"]})
+        else:
+            matched.append({"true": ev["label"], "pred": None, "ok": False,
+                            "confidence": 0.0})
+    total = len(truths)
+    return {
+        "total": total,
+        "correct": correct,
+        "accuracy": (correct / total) if total else 0.0,
+        "detected": len(predictions),
+        "missed": sum(1 for m in matched if m["pred"] is None),
+        "spurious": sum(1 for c in claimed if not c),
+        "matched": matched,
+    }
+
+
+def infer_file(clip_path, model_path, params=None):
+    """Headless: reconstruct the typing in a recording and print it."""
+    bundle = load_bundle(model_path)
+    sr = bundle.get("sample_rate", DEFAULT_SR)
+    audio, sr_ = load_audio(clip_path, sr=sr)
+    preds = infer_audio(audio, sr_, bundle, params=params)
+    text = reconstruct_text(preds)
+    print(f"Detected {len(preds)} keystrokes in {clip_path}")
+    print(f"Reconstructed: {text!r}\n")
+    for pred in preds:
+        alts = "  ".join(f"{name}:{p*100:.0f}%" for name, p in pred["top"][:3])
+        print(f"  t={pred['t']:6.3f}s  {pred['label']:>8s}  "
+              f"{pred['confidence']*100:5.1f}%   ({alts})")
+    return preds
+
+
+# --------------------------------------------------------------------------
+# Inference UI
+# --------------------------------------------------------------------------
+
+class InferenceApp:
+    """Load a trained model, record typing, read it back from the sound.
+
+    Tick "score against what I type" and the real keystrokes are captured
+    alongside the audio, so the finish screen can show how much of the typing
+    the model recovered - a live read on how strong the acoustic leak is.
+    """
+
+    def __init__(self, root, model_path="keystroke_model.joblib",
+                 params=None, sr=DEFAULT_SR, device=None):
+        self.root = root
+        init_fonts(root)
+
+        root.title("keyloggd - keystroke inference")
+        root.configure(bg=BG)
+        root.geometry("1010x800")
+        root.minsize(900, 720)
+
+        self.model_path = os.path.abspath(model_path)
+        self.params = params or SegmentParams()
+        self.sr = sr
+        self.device = device
+
+        self.bundle = None
+        self.recorder = None
+        self.recording = False
+        self.score_var = tk.BooleanVar(value=True)
+        self.results = queue.Queue()
+
+        self._build_layout()
+        self.root.bind("<KeyPress>", self._on_keypress)
+        self.root.bind("<F9>", lambda e: self._toggle_record())
+        self.root.bind("<Control-r>", lambda e: self._toggle_record())
+        self.root.bind("<Escape>", lambda e: self._stop_recording())
+
+        self._try_load(self.model_path, announce=False)
+        if not SessionRecorder.available():
+            self._status("recording needs the 'sounddevice' package - "
+                         "pip install sounddevice", WARN)
+        self.root.after(60, self._tick)
+        self.root.after(80, self._drain_results)
+
+    # -- layout -------------------------------------------------------------
+
+    def _build_layout(self):
+        outer = tk.Frame(self.root, bg=BG)
+        outer.pack(fill="both", expand=True, padx=26, pady=22)
+        self._build_header(outer)
+        self._build_recorder(outer)
+        self._build_reconstruction(outer)
+        self._build_detail(outer)
+        self._build_footer(outer)
+
+    def _build_header(self, parent):
+        header = tk.Frame(parent, bg=BG)
+        header.pack(fill="x", pady=(0, 16))
+        left = tk.Frame(header, bg=BG)
+        left.pack(side="left")
+        tk.Label(left, text="keystroke inference", bg=BG, fg=FG_TEXT,
+                 font=ui(22)).pack(anchor="w")
+        tk.Label(left, bg=BG, fg=FG_LABEL, font=ui(11),
+                 text="record typing - the model reads it back from the sound"
+                 ).pack(anchor="w", pady=(2, 0))
+
+        right = tk.Frame(header, bg=BG)
+        right.pack(side="right")
+        pill = RoundedPanel(right, BG_INPUT, radius=8, padding=5, bg=BG)
+        pill.pack(side="left", padx=(0, 8))
+        self.model_label = tk.Label(pill.inner, bg=BG_INPUT, fg=FG_LABEL,
+                                    font=mono(10), padx=8, pady=3,
+                                    text="no model loaded")
+        self.model_label.pack(side="left")
+        PillButton(right, "load model", self._choose_model, size=10, bg=BG,
+                   padx=12, pady=6).pack(side="left")
+
+    def _build_recorder(self, parent):
+        panel = RoundedPanel(parent, BG_PANEL, radius=14, padding=16, bg=BG)
+        panel.pack(fill="x")
+        inner = panel.inner
+
+        row = tk.Frame(inner, bg=BG_PANEL)
+        row.pack(fill="x")
+        self.record_btn = PillButton(row, "start listening", self._toggle_record,
+                                     kind="primary", size=12, bg=BG_PANEL,
+                                     padx=22, pady=11)
+        self.record_btn.pack(side="left")
+        self.record_btn.set_enabled(False)
+
+        self.dot = tk.Canvas(row, width=14, height=14, bg=BG_PANEL, bd=0,
+                             highlightthickness=0)
+        self.dot.pack(side="left", padx=(14, 8))
+        self._dot_item = self.dot.create_oval(2, 2, 12, 12, fill=FG_DIM,
+                                              outline="")
+        self.timer_label = tk.Label(row, text="00:00.0", bg=BG_PANEL,
+                                    fg=FG_TEXT, font=mono(18))
+        self.timer_label.pack(side="left")
+        self.meter = LevelMeter(row, bg=BG_PANEL)
+        self.meter.pack(side="left", padx=18)
+
+        counts = tk.Frame(row, bg=BG_PANEL)
+        counts.pack(side="right")
+        self.heard_label = tk.Label(counts, text="0", bg=BG_PANEL, fg=FG_TEXT,
+                                    font=mono(18))
+        self.heard_label.pack(side="right")
+        tk.Label(counts, text="keys typed  ", bg=BG_PANEL, fg=FG_LABEL,
+                 font=ui(11)).pack(side="right")
+
+        toggle_row = tk.Frame(inner, bg=BG_PANEL)
+        toggle_row.pack(fill="x", pady=(12, 0))
+        self.score_toggle = tk.Label(
+            toggle_row, bg=BG_PANEL, fg=FG_TEXT, font=ui(11), cursor="hand2")
+        self.score_toggle.pack(side="left")
+        self.score_toggle.bind("<Button-1>", lambda e: self._toggle_score())
+        self._render_score_toggle()
+        tk.Label(toggle_row, bg=BG_PANEL, fg=FG_DIM, font=ui(10),
+                 text="   ctrl+r or F9 toggles   |   esc stops"
+                 ).pack(side="left")
+
+    def _build_reconstruction(self, parent):
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.pack(fill="x", pady=(16, 0))
+        head = tk.Frame(wrap, bg=BG)
+        head.pack(fill="x", pady=(0, 8))
+        tk.Label(head, text="reconstruction", bg=BG, fg=FG_TEXT,
+                 font=ui(13)).pack(side="left")
+        self.recon_stats = tk.Label(head, bg=BG, fg=FG_LABEL, font=ui(10),
+                                    text="what the model heard appears here")
+        self.recon_stats.pack(side="left", padx=(10, 0))
+
+        panel = RoundedPanel(wrap, BG_INPUT, radius=12, padding=10, bg=BG)
+        panel.pack(fill="x")
+        self.recon = tk.Text(
+            panel.inner, height=4, width=88, bg=BG_INPUT, fg=FG_TEXT,
+            font=mono(15), wrap="char", relief="flat", bd=0,
+            highlightthickness=0, padx=8, pady=6, state="disabled")
+        self.recon.pack(fill="x")
+
+    def _build_detail(self, parent):
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.pack(fill="both", expand=True, pady=(16, 0))
+        tk.Label(wrap, text="per-key", bg=BG, fg=FG_TEXT,
+                 font=ui(13)).pack(anchor="w", pady=(0, 8))
+        panel = RoundedPanel(wrap, BG_PANEL, radius=12, padding=10, bg=BG)
+        panel.pack(fill="both", expand=True)
+        holder = tk.Frame(panel.inner, bg=BG_PANEL)
+        holder.pack(fill="both", expand=True)
+        self.detail = tk.Text(
+            holder, height=8, bg=BG_PANEL, fg=FG_TEXT, font=mono(11),
+            wrap="none", relief="flat", bd=0, highlightthickness=0,
+            padx=8, pady=6, state="disabled")
+        scroll = tk.Scrollbar(holder, command=self.detail.yview)
+        self.detail.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.detail.pack(side="left", fill="both", expand=True)
+        self.detail.tag_configure("ok", foreground=OK)
+        self.detail.tag_configure("bad", foreground=FG_INCORRECT)
+        self.detail.tag_configure("dim", foreground=FG_DIM)
+        self.detail.tag_configure("warn", foreground=WARN)
+
+    def _build_footer(self, parent):
+        footer = tk.Frame(parent, bg=BG)
+        footer.pack(fill="x", pady=(16, 0))
+        holder = tk.Frame(footer, bg=BG)
+        holder.pack(side="left")
+        self.spinner = Spinner(holder, bg=BG)
+        PillButton(footer, "infer from file...", self._infer_from_file, size=10,
+                   bg=BG, padx=12, pady=6).pack(side="right")
+        self.status_label = tk.Label(footer, bg=BG, fg=FG_LABEL, font=ui(11),
+                                     anchor="w", justify="left",
+                                     text="load a trained model to begin")
+        self.status_label.pack(side="left", padx=(8, 0))
+
+    # -- helpers ------------------------------------------------------------
+
+    def _status(self, text, colour=None):
+        self.status_label.configure(text=text, fg=colour or FG_LABEL)
+
+    def _render_score_toggle(self):
+        box = "[x]" if self.score_var.get() else "[ ]"
+        self.score_toggle.configure(
+            text=f"{box} score against what I type",
+            fg=FG_TEXT if self.score_var.get() else FG_LABEL)
+
+    def _toggle_score(self):
+        if self.recording:
+            return
+        self.score_var.set(not self.score_var.get())
+        self._render_score_toggle()
+
+    def _short(self, path):
+        return path if len(path) <= 40 else "..." + path[-37:]
+
+    # -- model --------------------------------------------------------------
+
+    def _choose_model(self):
+        path = filedialog.askopenfilename(
+            title="Trained model",
+            initialdir=os.path.dirname(self.model_path) or ".",
+            filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")])
+        if path:
+            self._try_load(path, announce=True)
+
+    def _try_load(self, path, announce=True):
+        try:
+            bundle = load_bundle(path)
+        except FileNotFoundError:
+            if announce:
+                self._status(f"no model at {self._short(path)}", WARN)
+            return
+        except Exception as exc:
+            self._status(f"could not load model: {exc}", FG_INCORRECT)
+            return
+        self.bundle = bundle
+        self.model_path = os.path.abspath(path)
+        self.sr = bundle.get("sample_rate", self.sr)
+        n = len(bundle["label_encoder"].classes_)
+        self.model_label.configure(text=f"{os.path.basename(path)}  ({n} keys)")
+        if SessionRecorder.available():
+            self.record_btn.set_enabled(True)
+        self._status(f"model loaded - {n} keys known. record and type away.", OK)
+
+    def _require_model(self):
+        if self.bundle is None:
+            self._status("load a trained model first", WARN)
+            return False
+        return True
+
+    # -- recording ----------------------------------------------------------
+
+    def _toggle_record(self):
+        if self.recording:
+            self._stop_recording()
+        elif self._require_model():
+            self._start_recording()
+
+    def _start_recording(self):
+        if self.recording or not self._require_model():
+            return
+        self.recorder = SessionRecorder(sr=self.sr, device=self.device)
+        try:
+            self.recorder.start()
+        except Exception as exc:
+            self.recorder = None
+            self._status(f"could not start recording: {exc}", FG_INCORRECT)
+            return
+        self.recording = True
+        self.record_btn.set_text("stop and read back")
+        self.dot.itemconfigure(self._dot_item, fill=ACCENT)
+        self.meter.clear()
+        self._set_recon("", ())
+        self._set_detail([("dim", "listening...\n")])
+        mode = ("type the text and it will be scored" if self.score_var.get()
+                else "pure listen - no ground truth")
+        self._status(f"recording - {mode}", ACCENT)
+
+    def _stop_recording(self):
+        if not self.recording:
+            return
+        self.recording = False
+        recorder, self.recorder = self.recorder, None
+        self.record_btn.set_text("start listening")
+        self.record_btn.set_enabled(False)
+        self.dot.itemconfigure(self._dot_item, fill=FG_DIM)
+        self.meter.clear()
+
+        capture = recorder.stop()
+        if len(capture["audio"]) == 0:
+            self.record_btn.set_enabled(True)
+            self._status("stopped - no audio captured", WARN)
+            return
+        self._status("running the model over the recording...", FG_LABEL)
+        self.spinner.start(side="left")
+        scoring = self.score_var.get()
+        threading.Thread(target=self._infer_worker, args=(capture, scoring),
+                         daemon=True).start()
+
+    def _infer_worker(self, capture, scoring):
+        try:
+            preds = infer_audio(capture["audio"], capture["sample_rate"],
+                                self.bundle, params=self.params)
+            report = (score_predictions(preds, capture["events"],
+                                        capture["sample_rate"])
+                      if scoring else None)
+            self.results.put(("ok", (preds, report, capture)))
+        except Exception as exc:                            # pragma: no cover
+            self.results.put(("error", exc))
+
+    def _drain_results(self):
+        while True:
+            try:
+                kind, payload = self.results.get_nowait()
+            except queue.Empty:
+                break
+            self.spinner.stop()
+            self.record_btn.set_enabled(SessionRecorder.available()
+                                        and self.bundle is not None)
+            if kind == "error":
+                self._status(f"inference failed: {payload}", FG_INCORRECT)
+                continue
+            preds, report, capture = payload
+            self._present(preds, report, capture)
+        self.root.after(80, self._drain_results)
+
+    # -- presenting results -------------------------------------------------
+
+    def _present(self, preds, report, capture):
+        text = reconstruct_text(preds)
+        confs = [p["confidence"] for p in preds]
+        avg = sum(confs) / len(confs) if confs else 0.0
+        self._set_recon(text, ())
+
+        parts = [f"heard {len(preds)} keystrokes",
+                 f"avg confidence {avg*100:.0f}%",
+                 f"{capture['duration']:.1f}s"]
+        colour = FG_LABEL
+        if report is not None:
+            parts.insert(0, f"accuracy {report['accuracy']*100:.0f}% "
+                         f"({report['correct']}/{report['total']})")
+            if report["missed"] or report["spurious"]:
+                parts.append(f"{report['missed']} missed, "
+                             f"{report['spurious']} spurious")
+            colour = OK if report["accuracy"] >= 0.5 else WARN
+        self.recon_stats.configure(text="   |   ".join(parts), fg=colour)
+        self._status("done - see the reconstruction above", colour)
+
+        self._set_detail(self._detail_rows(preds, report))
+
+    def _detail_rows(self, preds, report):
+        rows = []
+        if report is not None:
+            # Ground-truth view: one row per real keypress, so misses and
+            # confusions show up in place.
+            for i, m in enumerate(report["matched"]):
+                true_disp = label_display(m["true"])
+                if m["pred"] is None:
+                    rows.append(("bad",
+                                 f"{i:>3}  {true_disp:>4}  ->   (missed)\n"))
+                    continue
+                pred_disp = label_display(m["pred"])
+                tag = "ok" if m["ok"] else "bad"
+                mark = "ok " if m["ok"] else "MISS"
+                rows.append((tag,
+                             f"{i:>3}  {true_disp:>4}  ->  {pred_disp:<4}  "
+                             f"{m['confidence']*100:5.1f}%  {mark}\n"))
+            if report["spurious"]:
+                rows.append(("warn",
+                             f"\n+ {report['spurious']} spurious detection(s) "
+                             "with no key behind them\n"))
+        else:
+            for pred in preds:
+                alts = "  ".join(f"{label_display(n)}:{p*100:.0f}%"
+                                 for n, p in pred["top"][1:3])
+                tag = ("ok" if pred["confidence"] >= 0.6
+                       else "warn" if pred["confidence"] >= 0.35 else "bad")
+                rows.append((tag,
+                             f"t={pred['t']:6.3f}s  "
+                             f"{label_display(pred['label']):>4}  "
+                             f"{pred['confidence']*100:5.1f}%   "
+                             f"[{alts}]\n"))
+        return rows or [("dim", "no keystrokes detected\n")]
+
+    def _set_recon(self, text, tags):
+        self.recon.configure(state="normal")
+        self.recon.delete("1.0", "end")
+        self.recon.insert("end", text or "-")
+        self.recon.configure(state="disabled")
+
+    def _set_detail(self, rows):
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        for tag, line in rows:
+            self.detail.insert("end", line, (tag,))
+        self.detail.configure(state="disabled")
+
+    # -- input --------------------------------------------------------------
+
+    def _on_keypress(self, event):
+        if not self.recording or self.recorder is None:
+            return
+        if event.state & 0x0004:                # ctrl-chord: app shortcut
+            return
+        if event.keysym in IGNORED_KEYSYMS:
+            return
+        # Ground truth is only worth capturing when we mean to score against
+        # it; in pure-listen mode the keyboard is just making sounds.
+        if self.score_var.get():
+            self.recorder.mark_key(event.keysym, event.char or "")
+
+    def _tick(self):
+        if self.recording and self.recorder is not None:
+            elapsed = self.recorder.elapsed
+            minutes, seconds = divmod(elapsed, 60)
+            self.timer_label.configure(
+                text=f"{int(minutes):02d}:{seconds:04.1f}")
+            self.heard_label.configure(text=str(self.recorder.key_count))
+            self.meter.push(self.recorder.level)
+        self.root.after(60, self._tick)
+
+    # -- file inference -----------------------------------------------------
+
+    def _infer_from_file(self):
+        if not self._require_model():
+            return
+        path = filedialog.askopenfilename(
+            title="Recording to read back",
+            filetypes=[("Audio", "*.wav *.mp3"), ("All files", "*.*")])
+        if not path:
+            return
+        self._status(f"reading {os.path.basename(path)}...", FG_LABEL)
+        self.spinner.start(side="left")
+        threading.Thread(target=self._file_worker, args=(path,),
+                         daemon=True).start()
+
+    def _file_worker(self, path):
+        try:
+            sr = self.bundle.get("sample_rate", self.sr)
+            audio, sr_ = load_audio(path, sr=sr)
+            preds = infer_audio(audio, sr_, self.bundle, params=self.params)
+            self.results.put(("ok", (preds, None,
+                                     {"duration": len(audio) / float(sr_),
+                                      "events": []})))
+        except Exception as exc:                            # pragma: no cover
+            self.results.put(("error", exc))
+
+
+def launch_inference(model_path="keystroke_model.joblib", params=None,
+                     sr=DEFAULT_SR, device=None):
+    """Open the inference platform."""
+    if _THEME_ERROR is not None:
+        sys.exit("The inference UI needs this project's theme.py and anim.py "
+                 f"alongside it ({_THEME_ERROR}).")
+    root = tk.Tk()
+    InferenceApp(root, model_path=model_path, params=params, sr=sr,
+                 device=device)
+    root.mainloop()
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1562,6 +2226,10 @@ def parse_args(argv=None):
                         help=f"dataset folder (default: {DEFAULT_DATA_DIR})")
     parser.add_argument("--annotate", action="store_true",
                         help="open the annotation platform (the default)")
+    parser.add_argument("--infer", action="store_true",
+                        help="open the inference platform (record and read back)")
+    parser.add_argument("--infer_file", type=str, metavar="CLIP",
+                        help="reconstruct the typing in a recording, headless")
     parser.add_argument("--train", action="store_true",
                         help="train a model from --data_dir")
     parser.add_argument("--predict", type=str,
@@ -1592,19 +2260,25 @@ def main(argv=None):
     params = SegmentParams.from_args(args)
     data_dir = args.data_dir or DEFAULT_DATA_DIR
 
+    device = args.device
+    if device is not None and device.isdigit():
+        device = int(device)
+
     if args.predict:
         if not os.path.exists(args.model_out):
             sys.exit(f"Model file not found: {args.model_out}. Train first.")
         predict(args.predict, args.model_out)
+    elif args.infer_file:
+        infer_file(args.infer_file, args.model_out, params=params)
     elif args.resegment:
         resegment(args.resegment, params)
+    elif args.infer:
+        launch_inference(args.model_out, params=params, sr=args.sr,
+                         device=device)
     # A bare --data_dir still trains, as it did before the annotator existed.
     elif args.train or (args.data_dir and not args.annotate):
         train(data_dir, args.model_out, sr=args.sr)
     else:
-        device = args.device
-        if device is not None and device.isdigit():
-            device = int(device)
         launch_annotator(data_dir, params=params, target=args.target,
                          sr=args.sr, device=device)
 
