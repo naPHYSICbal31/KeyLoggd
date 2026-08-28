@@ -122,6 +122,55 @@ def generate_dataset(
         print(f"wrote {out_path}  ({n_samples} samples)")
 
 
+MULTI_OUT_DIR = os.path.join(os.path.dirname(__file__), "data", "synthetic_multi")
+
+
+def generate_multiphrase_dataset(
+    phrases: list,
+    n_users: int = N_USERS,
+    n_samples_per_phrase: int = 6,
+    seed: int = 7,
+    out_dir: str = MULTI_OUT_DIR,
+):
+    """Every simulated user types *every* phrase, for free-text evaluation.
+
+    The single-phrase generator above gives each user a per-character bias built
+    from that one phrase, which is fine when the phrase never changes. Here the
+    profile is built once over the union of all the phrases' characters instead,
+    so the same person carries the same per-key habits from sentence to sentence
+    -- which is exactly the thing a cross-sentence test has to measure. (The
+    per-sample generator already falls back to a neutral 1.0 bias for a
+    character it has not seen, so a shared alphabet only makes the profile more
+    complete, never less valid.)
+
+    Written to its own directory: data/synthetic/ holds real captures and the
+    app's live enrolled set, and must not be overwritten by a test fixture.
+    """
+    rng = np.random.default_rng(seed)
+    os.makedirs(out_dir, exist_ok=True)
+    alphabet = "".join(sorted(set("".join(phrases))))
+
+    for u in range(n_users):
+        user_id = f"user_{u:02d}"
+        profile = make_user_profile(rng, alphabet)
+
+        samples = []
+        for phrase in phrases:
+            for _ in range(n_samples_per_phrase):
+                sample = generate_sample(rng, phrase, profile)
+                # per-sample phrase, the schema the capture tool writes
+                sample["phrase"] = phrase
+                samples.append(sample)
+
+        record = {"user_id": user_id, "phrase": phrases[0], "samples": samples}
+        out_path = os.path.join(out_dir, f"{user_id}.json")
+        with open(out_path, "w") as f:
+            json.dump(record, f, indent=2)
+
+        print(f"wrote {out_path}  ({len(samples)} samples over "
+              f"{len(phrases)} phrases)")
+
+
 if __name__ == "__main__":
     generate_dataset()
     print(f"\nDone. Synthetic dataset for {N_USERS} users written to: {OUT_DIR}")

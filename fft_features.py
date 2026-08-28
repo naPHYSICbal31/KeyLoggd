@@ -32,14 +32,48 @@ def zero_pad(x: np.ndarray, n: int = FFT_LEN) -> np.ndarray:
     return out
 
 
-def compute_spectrum(x: np.ndarray, n: int = FFT_LEN) -> np.ndarray:
+def resample_fixed(x: np.ndarray, n: int = FFT_LEN) -> np.ndarray:
     """
-    Zero-pad x to length n and return the complex FFT (numpy.fft.fft).
-    We keep the full complex spectrum here; magnitude/phase are derived by
-    the caller depending on what's needed (features vs. reconstruction).
+    Linearly interpolate x onto exactly n points, stretching or compressing it.
+
+    Why this exists (and when to prefer it over zero_pad):
+        Zero-padding leaves the signal sitting in a rectangular window whose
+        width is the number of keystrokes, so the spectrum it produces is a
+        function of *how long the typed text was* as much as of how the person
+        typed. That is harmless while everyone types one fixed phrase, but it
+        means a sample of a longer sentence lands somewhere else in feature
+        space for reasons that have nothing to do with the typist -- and
+        zero_pad also truncates anything past n, silently discarding the tail.
+
+        Resampling gives every sample identical support, so the spectrum
+        describes the *shape* of the typing rhythm and stays comparable across
+        sentences of different lengths.
     """
-    x_padded = zero_pad(x, n)
-    return np.fft.fft(x_padded)
+    x = np.asarray(x, dtype=float)
+    if len(x) == 0:
+        return np.zeros(n, dtype=float)
+    if len(x) == 1:
+        return np.full(n, float(x[0]))
+    source = np.linspace(0.0, 1.0, len(x))
+    target = np.linspace(0.0, 1.0, n)
+    return np.interp(target, source, x)
+
+
+def prepare(x: np.ndarray, n: int = FFT_LEN, mode: str = "pad") -> np.ndarray:
+    """Bring a raw dwell/flight signal to length n, by zero-padding (the
+    original behaviour) or by resampling (length-invariant)."""
+    return resample_fixed(x, n) if mode == "resample" else zero_pad(x, n)
+
+
+def compute_spectrum(x: np.ndarray, n: int = FFT_LEN,
+                     mode: str = "pad") -> np.ndarray:
+    """
+    Bring x to length n (see prepare) and return the complex FFT
+    (numpy.fft.fft). We keep the full complex spectrum here; magnitude/phase
+    are derived by the caller depending on what's needed (features vs.
+    reconstruction).
+    """
+    return np.fft.fft(prepare(x, n, mode))
 
 
 def spectral_features(spectrum: np.ndarray) -> dict:
@@ -82,15 +116,20 @@ def spectral_features(spectrum: np.ndarray) -> dict:
     }
 
 
-def feature_vector(dwell: np.ndarray, flight: np.ndarray, n: int = FFT_LEN) -> np.ndarray:
+def feature_vector(dwell: np.ndarray, flight: np.ndarray, n: int = FFT_LEN,
+                   mode: str = "pad") -> np.ndarray:
     """
     Build one combined numeric feature vector for a typing sample, from both
     the dwell and flight signals. This is what gets fed to the classifier
     (kNN/SVM) later, and what gets compared distance-wise between a login
     attempt and stored per-user templates.
+
+    mode="pad" zero-pads to n (fine for a fixed enrollment phrase);
+    mode="resample" interpolates to n so the features survive a change of
+    sentence -- see resample_fixed and day3_cross_phrase_eval.py.
     """
-    dwell_spec = compute_spectrum(dwell, n)
-    flight_spec = compute_spectrum(flight, n)
+    dwell_spec = compute_spectrum(dwell, n, mode)
+    flight_spec = compute_spectrum(flight, n, mode)
 
     d_feat = spectral_features(dwell_spec)
     f_feat = spectral_features(flight_spec)
