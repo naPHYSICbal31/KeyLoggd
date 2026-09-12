@@ -3,39 +3,19 @@
 #     pip install -r requirements.txt
 #
 # Version floors are the versions this project has actually been run against,
-# not guesses. Everything else it uses - tkinter, wave, argparse, json,
-# threading, queue - is in the standard library.
+# not guesses. Everything else it uses - tkinter, json, argparse, threading,
+# queue, datetime - is in the standard library.
 
 # --- Core ------------------------------------------------------------------
-# Used by essentially every module.
+# The whole pipeline: FFT features, templates, distances, the EER sweep.
+# The UI's own layer (theme, charts, the typing test, the sample splitter)
+# needs nothing beyond the standard library.
 numpy>=2.4.2
-
-# --- Recording (annotation + inference platforms) --------------------------
-# Microphone capture. Wheels bundle PortAudio on Windows and macOS; on Linux
-# install the system library too:  sudo apt install libportaudio2
-sounddevice>=0.5.6
-
-# --- Training and inference -----------------------------------------------
-# Feature extraction (MFCCs, spectral descriptors) and the classifier.
-# The annotation platform does NOT need these - it writes .wav with the
-# stdlib wave module - but training a model and reading typing back does.
-librosa>=1.0.0
-scikit-learn>=1.9.0
-joblib>=1.5.3
-
-# Reading/writing audio files. librosa pulls this in as well, but
-# keystroke_gui.py imports it directly, so it is named here explicitly.
-soundfile>=0.14.0
-
-# --- Analysis and plots ---------------------------------------------------
-# Only for the day1/day2 verification reports, which render .png charts.
-# Not needed to record, train, or run inference.
-matplotlib>=3.11.0
 
 # --- Notes ----------------------------------------------------------------
 # tkinter ships with CPython but is packaged separately on some Linux
 # distributions:  sudo apt install python3-tk
 #
 # The Anthropic Serif / Roboto Mono fonts the UI prefers are optional -
-# theme.py resolves against whatever families Tk can see and falls back
-# cleanly (run fontscheck.py to see what it found).
+# keyloggd/ui/theme.py resolves against whatever families Tk can see and
+# falls back cleanly.
