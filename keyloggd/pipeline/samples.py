@@ -7,12 +7,17 @@ keystrokes -- so something has to decide where one sample ends and the next
 begins.
 
 That decision is here rather than in the UI, because it is a signal-processing
-choice and not a presentation one: the pipeline reads a fixed window of
-KEYS_PER_SAMPLE keystrokes per sample (see fft_features.FFT_LEN), so cutting
-the run into windows of exactly that size is what makes every sample carry a
-full spectrum instead of a mostly zero-padded one. A 30-second test at a
-normal pace yields four or five samples, which is why the typing test can
-reach a usable enrollment in a handful of runs.
+choice and not a presentation one, and it is a trade-off in both directions.
+Longer windows estimate the features better: timing_features is built on
+medians, interquartile ranges and rollover rates, and those need enough
+keystrokes to be stable. Shorter windows give more samples per run, and more
+samples per run is what the fused verdict averages over
+(identify_sample.fuse) -- three samples identify better than one.
+
+Thirty-two keystrokes is the middle of that: enough for a usable median,
+while a 30-second test at a normal pace still yields four or five samples.
+That is why the typing test can reach a usable enrollment in a handful of
+runs.
 
 Stdlib only, deliberately: the enroll view calls this on every finished test
 and should not drag numpy in behind it.
@@ -20,14 +25,16 @@ and should not drag numpy in behind it.
 
 from datetime import datetime
 
-#: Keystrokes per emitted sample. Mirrors fft_features.FFT_LEN -- the length
-#: every signal is zero-padded or truncated to before its FFT. Kept as a
-#: literal so this module stays import-light; the two must move together.
+#: Keystrokes per emitted sample. No longer tied to fft_features.FFT_LEN:
+#: the feature vector is computed from the signal at its own length, so this
+#: is free to change without moving anything else. It stays at 32 because
+#: that is where the estimate-quality / samples-per-run trade-off sits.
 KEYS_PER_SAMPLE = 32
 
-#: A trailing window shorter than this is dropped rather than zero-padded.
-#: Half the window is the point past which padding, not typing, dominates the
-#: spectrum -- such a sample would describe the padding more than the typist.
+#: A trailing window shorter than this is dropped. Below about sixteen
+#: keystrokes a median and an interquartile range are being read off so few
+#: values that the sample describes its own noise more than its typist, and
+#: one such sample in a run drags the pooled verdict with it.
 MIN_KEYS = KEYS_PER_SAMPLE // 2
 
 

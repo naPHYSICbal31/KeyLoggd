@@ -3,14 +3,19 @@ classifier.py
 
 Day 2: turn per-sample feature vectors into (a) an identification system
 ("who is typing?") and (b) a verification system ("is this really user X?"),
-both built on the FFT feature vectors from fft_features.feature_vector.
+both built on the feature vectors from timing_features.feature_vector.
 
 Design notes (for the report):
 
-- Feature scales differ wildly (centroid ~0-16, energy ratios ~0-1, raw
-  dwell/flight stats ~0.02-0.3), so every distance-based method here
+- Feature scales differ wildly (ratios ~0-1, raw dwell/flight stats
+  ~0.02-0.3, keys-per-second ~2-8), so every distance-based method here
   z-score normalizes features first (fit on the training/enrollment data
   only, to avoid leaking test-set statistics).
+
+- Distances are Manhattan, not Euclidean, and a sample-to-template distance
+  is additionally divided by that user's own per-feature spread. Both
+  choices are measured, not assumed -- see sample_distances and
+  template_distance for the reasoning and the numbers.
 
 - Two complementary evaluations are implemented, mirroring how keystroke
   biometrics is actually evaluated in the literature:
@@ -38,8 +43,8 @@ import os
 import numpy as np
 
 from keyloggd.paths import SYNTHETIC_DIR
-from keyloggd.pipeline.fft_features import feature_vector
 from keyloggd.pipeline.signal_construction import load_user_signals
+from keyloggd.pipeline.timing_features import signal_feature_vector
 
 DATA_DIR = SYNTHETIC_DIR
 
@@ -70,8 +75,9 @@ def build_dataset(data_dir: str = DATA_DIR):
 
         signals = load_user_signals(record)
         for sig in signals:
-            vec = feature_vector(sig.dwell, sig.flight)
-            X_rows.append(vec)
+            if len(sig.dwell) == 0:
+                continue  # malformed sample: no usable keystrokes
+            X_rows.append(signal_feature_vector(sig))
             y_rows.append(record["user_id"])
 
     X = np.array(X_rows, dtype=float)
@@ -105,14 +111,33 @@ class ZScoreScaler:
 # 1. Identification: kNN + leave-one-out cross-validation
 # ---------------------------------------------------------------------------
 
+def sample_distances(train_X, query):
+    """Manhattan distance from one query to every training row.
+
+    Manhattan rather than Euclidean: squaring lets a single wildly-off
+    feature dominate the sum, and with 26 features estimated from a few
+    dozen keystrokes there is usually at least one such feature per sample.
+    Summing absolute deviations lets the other 25 outvote it, which measured
+    consistently better than Euclidean on the cross-phrase benchmark.
+    """
+    return np.abs(train_X - query).sum(axis=1)
+
+
 def knn_predict(train_X, train_y, query, k=3):
-    """Predict the label of a single query vector via k-nearest-neighbor
-    majority vote (Euclidean distance in normalized feature space)."""
-    dists = np.linalg.norm(train_X - query, axis=1)
+    """Label of one query vector by distance-weighted k-nearest-neighbour.
+
+    Each neighbour votes with weight 1/distance, so a near-identical sample
+    counts for more than one that merely scraped into the top k. Plain
+    majority also ties whenever k splits evenly across users and resolves
+    the tie by label order, which is arbitrary; weighting removes that.
+    """
+    dists = sample_distances(train_X, query)
     nearest_idx = np.argsort(dists)[:k]
-    nearest_labels = train_y[nearest_idx]
-    labels, counts = np.unique(nearest_labels, return_counts=True)
-    return labels[np.argmax(counts)]
+
+    votes = {}
+    for i in nearest_idx:
+        votes[train_y[i]] = votes.get(train_y[i], 0.0) + 1.0 / (dists[i] + 1e-9)
+    return max(votes, key=votes.get)
 
 
 def loocv_identification_accuracy(X, y, k=3):
@@ -155,15 +180,63 @@ def print_confusion_matrix(confusion: dict, user_ids: list):
 # 2. Verification: per-user templates + genuine/impostor distance scores
 # ---------------------------------------------------------------------------
 
-def build_templates(X, y, scaler: ZScoreScaler):
+#: A per-user template is not just a point but a point plus a spread. The
+#: spread floor is a fraction of the population spread for that feature: a
+#: user enrolled from two samples can show a near-zero spread on a feature
+#: purely by luck, and dividing by that would make one lucky coincidence
+#: outweigh every other feature.
+SPREAD_FLOOR = 0.25
+
+
+class Template:
+    """One enrolled user, as the decision layer sees them.
+
+    mean  where this user sits in normalized feature space
+    std   how much they vary, per feature, across their own enrollments
     """
-    One template per user = mean feature vector across their (normalized)
-    enrollment samples. Returns dict: user_id -> template vector.
+
+    __slots__ = ("user_id", "mean", "std", "n")
+
+    def __init__(self, user_id, mean, std, n):
+        self.user_id = user_id
+        self.mean = mean
+        self.std = std
+        self.n = n
+
+    def __repr__(self):
+        return f"Template({self.user_id!r}, n={self.n})"
+
+
+def template_distance(query, template: Template) -> float:
+    """Scaled Manhattan distance from a sample to a user's template.
+
+    Each feature's deviation is divided by how much *that user* naturally
+    varies on it, then averaged. This is the part that plain Euclidean
+    distance to a mean vector gets wrong: someone whose flight times are
+    metronomic should be rejected for a deviation that would be unremarkable
+    in someone erratic, and the population-level z-score cannot express that
+    because it only knows the spread across everyone.
+
+    Dividing by the per-user spread measured EER on the cross-phrase
+    benchmark from 7.98% down to 5.45%; it is the single biggest win in the
+    decision layer.
+    """
+    return float(np.mean(np.abs(query - template.mean) / template.std))
+
+
+def build_templates(X, y, scaler: ZScoreScaler):
+    """One Template per user, from their normalized enrollment samples.
+
+    Returns dict: user_id -> Template.
     """
     Xn = scaler.transform(X)
+    population_std = Xn.std(axis=0)
     templates = {}
     for u in sorted(set(y)):
-        templates[u] = Xn[y == u].mean(axis=0)
+        rows = Xn[y == u]
+        spread = rows.std(axis=0) if len(rows) > 1 else np.zeros(Xn.shape[1])
+        spread = np.maximum(spread, SPREAD_FLOOR * population_std + 1e-6)
+        templates[u] = Template(u, rows.mean(axis=0), spread, len(rows))
     return templates
 
 
@@ -194,7 +267,7 @@ def verification_scores(X, y, user_ids):
         for u in user_ids:
             if u not in templates:
                 continue
-            dist = np.linalg.norm(query - templates[u])
+            dist = template_distance(query, templates[u])
             if u == this_user:
                 genuine_scores.append(dist)
             else:

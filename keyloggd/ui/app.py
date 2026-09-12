@@ -127,18 +127,23 @@ def load_pipeline():
         import numpy as np
 
         from keyloggd.pipeline.classifier import (ZScoreScaler, build_dataset, build_templates,
-                                knn_predict)
-        from keyloggd.pipeline.fft_features import (FFT_LEN, compute_spectrum, feature_vector,
+                                knn_predict, template_distance)
+        from keyloggd.pipeline.fft_features import (FFT_LEN, compute_spectrum,
                                   spectral_features, zero_pad)
         from keyloggd.pipeline.identify_sample import (UNRECOGNIZED, compute_open_set_threshold,
-                                     identify, load_unknown_samples)
+                                     fuse, identify, load_unknown_samples)
         from keyloggd.pipeline.signal_construction import sample_to_signal
+        from keyloggd.pipeline.timing_features import (FEATURE_NAMES, feature_vector,
+                                    signal_feature_vector)
 
         _PIPELINE = {
             "np": np,
             "build_dataset": build_dataset,
             "feature_vector": feature_vector,
+            "signal_feature_vector": signal_feature_vector,
+            "FEATURE_NAMES": FEATURE_NAMES,
             "identify": identify,
+            "fuse": fuse,
             "load_unknown_samples": load_unknown_samples,
             "compute_open_set_threshold": compute_open_set_threshold,
             "sample_to_signal": sample_to_signal,
@@ -152,6 +157,7 @@ def load_pipeline():
             "ZScoreScaler": ZScoreScaler,
             "build_templates": build_templates,
             "knn_predict": knn_predict,
+            "template_distance": template_distance,
         }
     return _PIPELINE
 
@@ -1656,7 +1662,7 @@ class CaptureToolApp:
             sig = p["sample_to_signal"](sample)
             if len(sig.dwell) == 0:
                 continue
-            vecs.append(p["feature_vector"](sig.dwell, sig.flight))
+            vecs.append(p["signal_feature_vector"](sig))
         if not vecs:
             raise ValueError("sample had no usable keystrokes")
         unknown_X = p["np"].array(vecs)
@@ -1726,11 +1732,11 @@ class CaptureToolApp:
         p = self.pipeline
         unrecognized = p["UNRECOGNIZED"]
 
-        # per-sample decisions, then a majority vote across them (matching
-        # identify_sample.py's "overall decision" line)
-        decisions = [r["decision"] for r in results]
-        overall = max(set(decisions), key=decisions.count)
-        first = results[0]
+        # One verdict from every sample of the run, by pooling distances
+        # rather than voting on per-sample answers -- identify_sample.fuse
+        # explains why, and the app and the CLI now agree by construction.
+        first = p["fuse"](results, threshold=self.threshold)
+        overall = first["decision"]
 
         accepted = overall != unrecognized
         colour = ACCENT if accepted else FG_INCORRECT

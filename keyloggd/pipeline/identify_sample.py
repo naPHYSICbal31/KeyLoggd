@@ -36,12 +36,42 @@ from keyloggd.pipeline.classifier import (
     build_templates,
     equal_error_rate,
     knn_predict,
+    template_distance,
     verification_scores,
 )
-from keyloggd.pipeline.fft_features import feature_vector
+from keyloggd.pipeline.timing_features import signal_feature_vector
 from keyloggd.pipeline.signal_construction import sample_to_signal
 
 UNRECOGNIZED = "UNRECOGNIZED"
+
+#: How far past the EER point to put the accept threshold.
+#:
+#: The equal-error point is where false accepts and false rejects are equally
+#: likely. That is the right place to *report* a system's quality from, but it
+#: is a needlessly strict place to run one: it treats turning away the
+#: enrolled user as exactly as costly as admitting a stranger, and for this
+#: tool -- which identifies rather than guards anything -- being turned away
+#: is the more annoying failure by a wide margin.
+#:
+#: Measured on the cross-phrase benchmark (8 users), as a multiple of the
+#: EER threshold:
+#:
+#:     x1.00   genuine rejected  5.8%   impostor accepted   6.1%
+#:     x1.15   genuine rejected  2.9%   impostor accepted  10.1%
+#:     x1.20   genuine rejected  2.5%   impostor accepted  11.7%
+#:     x1.30   genuine rejected  0.8%   impostor accepted  14.5%
+#:
+#: 1.20 cuts the false rejections to well under half for a few points of
+#: false accepts. It is also where the real enrolled set here stops turning
+#: away one of its own samples, while 1.15 changed nothing on it -- the two
+#: are within noise of each other on the benchmark, so the real data broke
+#: the tie.
+#:
+#: The threshold only decides whether the closest template is close *enough*,
+#: never which one is closest, so moving it cannot change who a sample is
+#: identified as -- only whether the answer is given at all. Raise it to be
+#: more forgiving, lower it toward 1.0 to be stricter.
+ACCEPT_TOLERANCE = 1.20
 
 DEFAULT_DATA_DIR = SYNTHETIC_DIR
 
@@ -61,21 +91,28 @@ def load_unknown_samples(path: str):
         sig = sample_to_signal(s)
         if len(sig.dwell) == 0:
             continue  # malformed/empty sample, skip
-        vecs.append(feature_vector(sig.dwell, sig.flight))
+        vecs.append(signal_feature_vector(sig))
     return np.array(vecs)
 
 
-def compute_open_set_threshold(enrolled_X, enrolled_y, user_ids):
+def compute_open_set_threshold(enrolled_X, enrolled_y, user_ids,
+                               tolerance: float = ACCEPT_TOLERANCE):
     """
     Derive a distance threshold for "is this person enrolled at all?" using
     the same leave-one-out genuine/impostor scoring as classifier.py's
-    verification eval, then picking the EER threshold. Below this distance:
-    treat as a plausible match. Above it: reject as unrecognized, regardless
-    of which template happened to be closest.
+    verification eval, then picking the EER threshold and relaxing it by
+    `tolerance`. Below this distance: treat as a plausible match. Above it:
+    reject as unrecognized, regardless of which template happened to be
+    closest.
+
+    Returns (threshold, eer). The EER returned is the measured one at the
+    equal-error point, not at the relaxed threshold -- it describes how well
+    the enrolled set separates, which is a property of the data and does not
+    change because the operating point moved. See ACCEPT_TOLERANCE.
     """
     genuine, impostor = verification_scores(enrolled_X, enrolled_y, user_ids)
     eer, threshold = equal_error_rate(genuine, impostor)
-    return threshold, eer
+    return threshold * tolerance, eer
 
 
 def identify(unknown_X, enrolled_X, enrolled_y, k=3, threshold=None):
@@ -97,7 +134,7 @@ def identify(unknown_X, enrolled_X, enrolled_y, k=3, threshold=None):
 
         vote = knn_predict(train_X, enrolled_y, query, k=k)
 
-        dists = {u: float(np.linalg.norm(query - templates[u])) for u in user_ids}
+        dists = {u: template_distance(query, templates[u]) for u in user_ids}
         ranked = sorted(dists.items(), key=lambda kv: kv[1])
 
         closest_user, closest_dist = ranked[0]
@@ -121,6 +158,50 @@ def identify(unknown_X, enrolled_X, enrolled_y, k=3, threshold=None):
     return results
 
 
+def fuse(results, threshold=None):
+    """One verdict from every sample of a run, instead of one vote per sample.
+
+    A typing test emits four or five samples from a single sitting. Judging
+    each alone throws away the fact that they are known to come from the same
+    person: one unlucky sample -- a phone buzzing mid-sentence, a burst of
+    unusually fast typing -- can sit far from its own template while its
+    siblings sit right on it.
+
+    Pooling the *distances* rather than voting on the per-sample answers is
+    what makes that recoverable: a sample that was merely second-best still
+    contributes evidence, where a vote discards it entirely. Averaging beat
+    both median and min pooling on the benchmark, and takes cross-phrase
+    identification from 93.3% on one sample to 97.9% on three and 100% on
+    five.
+
+    Returns the same shape as one entry of identify(), plus n_samples.
+    """
+    if not results:
+        raise ValueError("no samples to fuse")
+
+    users = sorted(dict(results[0]["ranked_distances"]))
+    pooled = {
+        u: float(np.mean([dict(r["ranked_distances"])[u] for r in results]))
+        for u in users
+    }
+    ranked = sorted(pooled.items(), key=lambda kv: kv[1])
+
+    closest_user, closest_dist = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else float("inf")
+    accepted = threshold is None or closest_dist <= threshold
+
+    return {
+        "knn_vote": closest_user,
+        "closest_template": closest_user,
+        "closest_dist": closest_dist,
+        "ranked_distances": ranked,
+        "margin": second - closest_dist,
+        "accepted": accepted,
+        "decision": closest_user if accepted else UNRECOGNIZED,
+        "n_samples": len(results),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Guess who typed an unknown sample.")
     parser.add_argument("unknown_file", help="Path to a JSON file in the enrollment schema")
@@ -133,6 +214,15 @@ def main():
         help="Distance threshold for accept/reject. Default: auto-computed EER "
         "threshold from the enrolled set. Pass --no-threshold to disable "
         "open-set rejection entirely (always force a guess, old behavior).",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=ACCEPT_TOLERANCE,
+        help=f"How far past the equal-error point to put the accept "
+             f"threshold (default {ACCEPT_TOLERANCE}). Above 1.0 is more "
+             f"forgiving of the enrolled user, 1.0 is the strict EER point. "
+             f"Ignored when --threshold is given.",
     )
     parser.add_argument(
         "--no-threshold",
@@ -152,8 +242,11 @@ def main():
         threshold = args.threshold
         print(f"Using manual distance threshold: {threshold:.3f}\n")
     else:
-        threshold, eer = compute_open_set_threshold(enrolled_X, enrolled_y, user_ids)
-        print(f"Auto distance threshold: {threshold:.3f}  (from enrolled-set EER = {eer * 100:.2f}%)\n")
+        threshold, eer = compute_open_set_threshold(
+            enrolled_X, enrolled_y, user_ids, tolerance=args.tolerance)
+        print(f"Auto distance threshold: {threshold:.3f}  "
+              f"(EER point x{args.tolerance:g}; "
+              f"enrolled-set EER = {eer * 100:.2f}%)\n")
 
     unknown_X = load_unknown_samples(args.unknown_file)
     print(f"Loaded {len(unknown_X)} unknown sample(s) from {args.unknown_file}\n")
@@ -170,11 +263,18 @@ def main():
             print(f"    {u:12s} {d:.3f}")
         print()
 
-    # overall guess across all provided unknown samples (majority of per-sample decisions)
-    decisions = [r["decision"] for r in results]
-    labels, counts = np.unique(decisions, return_counts=True)
-    overall = labels[np.argmax(counts)]
-    print(f"Overall decision across all {len(results)} sample(s): {overall}")
+    # Overall verdict: pooled distances across every sample, not a majority
+    # vote of the per-sample answers -- see fuse().
+    overall = fuse(results, threshold=threshold)
+    print(f"=== Overall verdict across {overall['n_samples']} sample(s) ===")
+    print(f"  Decision:            {overall['decision']}"
+          + ("" if overall["accepted"] else "  (no template close enough)"))
+    print(f"  Closest template:    {overall['closest_template']}  "
+          f"(pooled dist={overall['closest_dist']:.3f}, "
+          f"margin over 2nd: {overall['margin']:.3f})")
+    print("  Pooled distances (closest first):")
+    for u, d in overall["ranked_distances"]:
+        print(f"    {u:12s} {d:.3f}")
 
 
 if __name__ == "__main__":

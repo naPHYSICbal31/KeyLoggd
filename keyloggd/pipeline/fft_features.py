@@ -120,9 +120,15 @@ def feature_vector(dwell: np.ndarray, flight: np.ndarray, n: int = FFT_LEN,
                    mode: str = "pad") -> np.ndarray:
     """
     Build one combined numeric feature vector for a typing sample, from both
-    the dwell and flight signals. This is what gets fed to the classifier
-    (kNN/SVM) later, and what gets compared distance-wise between a login
-    attempt and stored per-user templates.
+    the dwell and flight signals.
+
+    NOT the vector the pipeline identifies on any more -- that is
+    timing_features.feature_vector, which measured substantially better
+    (leave-one-phrase-out identification 68.8% -> 92.5%, verification EER
+    18.7% -> 5.5%). This one is kept because it is the spectral formulation
+    the project started from and the explain view still shows the spectrum
+    behind it; timing_features documents why it loses. Do not wire it back
+    into the classifier without re-running the benchmark.
 
     mode="pad" zero-pads to n (fine for a fixed enrollment phrase);
     mode="resample" interpolates to n so the features survive a change of

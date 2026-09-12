@@ -7,8 +7,9 @@ from the real modules at every step.
 
 Nothing here re-implements the maths. Each phase calls the same functions the
 identify path calls -- signal_construction.events_to_signal, fft_features
-(zero_pad / compute_spectrum / spectral_features / feature_vector), classifier
-(ZScoreScaler / build_templates / knn_predict) -- and simply keeps the
+(zero_pad / compute_spectrum / spectral_features), timing_features
+(feature_vector), classifier (ZScoreScaler / build_templates /
+template_distance / knn_predict) -- and simply keeps the
 intermediate values so they can be plotted. If the pipeline changes, this view
 changes with it rather than drifting into a pretty lie.
 
@@ -17,13 +18,18 @@ Phases, and the chart form each one earns:
   1 capture    dwell/flight per keystroke      grouped columns, two series (ms)
   2 pad        zero-padding to N = 32          the same columns + a shaded band
   3 spectrum   |FFT| per frequency bin         grouped columns, two series
-  4 features   the 14-number feature vector    a table, not a chart: the
+  4 features   the feature vector              a table, not a chart: the
                                                components have different units,
                                                and one axis cannot honestly
-                                               carry centroids, ratios and
+                                               carry fractions, ratios and
                                                milliseconds at once
   5 normalise  z-scores vs the enrolled set    diverging columns about zero
   6 decide     distance to every template      horizontal bars + threshold
+
+Steps 2 and 3 are the frequency-domain view of the rhythm. They are shown
+because they are the clearest explanation of what is being measured, but the
+vector in step 4 is built from robust time-domain statistics instead -- the
+spectrum was measured against them and lost. timing_features says why.
 """
 
 import tkinter as tk
@@ -34,26 +40,6 @@ from keyloggd.ui.charts import (SERIES_1, SERIES_2, Band, Chart, ChartSpec, RefL
                                 Series)
 from keyloggd.ui.theme import (ACCENT, BG, BG_PANEL, FG_DIM, FG_INCORRECT, FG_LABEL,
                                FG_TEXT, OK, PillButton, mono, ui)
-
-# (full name for the values panel, compact axis code). Fourteen categories
-# share one axis, so the codes have to stay short enough not to collide --
-# the panel beside the chart carries the full names.
-FEATURE_NAMES = [
-    ("dwell centroid", "dCen"),
-    ("dwell low-band energy", "dLow"),
-    ("dwell mid-band energy", "dMid"),
-    ("dwell high-band energy", "dHi"),
-    ("dwell total energy", "dE"),
-    ("flight centroid", "fCen"),
-    ("flight low-band energy", "fLow"),
-    ("flight mid-band energy", "fMid"),
-    ("flight high-band energy", "fHi"),
-    ("flight total energy", "fE"),
-    ("mean dwell", "mDw"),
-    ("std dwell", "sdDw"),
-    ("mean flight", "mFl"),
-    ("std flight", "sdFl"),
-]
 
 AUTOPLAY_MS = 3200
 
@@ -87,7 +73,8 @@ def build_phases(sample, enrolled, pipeline):
     dwell_feat = pipeline["spectral_features"](dwell_spec)
     flight_feat = pipeline["spectral_features"](flight_spec)
 
-    vector = pipeline["feature_vector"](dwell, flight)
+    feature_names = pipeline["FEATURE_NAMES"]
+    vector = pipeline["signal_feature_vector"](signal)
 
     X, y, user_ids = enrolled["X"], enrolled["y"], enrolled["user_ids"]
     scaler = pipeline["ZScoreScaler"]().fit(X)
@@ -96,7 +83,8 @@ def build_phases(sample, enrolled, pipeline):
     vote = pipeline["knn_predict"](scaler.transform(X), y, z, k=3)
 
     distances = sorted(
-        ((user, float(np.linalg.norm(z - templates[user]))) for user in user_ids),
+        ((user, pipeline["template_distance"](z, templates[user]))
+         for user in user_ids),
         key=lambda kv: kv[1])
     closest_user, closest_dist = distances[0]
     runner_up = distances[1][1] if len(distances) > 1 else float("inf")
@@ -153,9 +141,12 @@ def build_phases(sample, enrolled, pipeline):
             key="spectrum",
             title="3 - FFT",
             lead="The FFT turns each signal into a magnitude spectrum: how "
-                 "typing energy is spread across rhythm frequencies. This is "
-                 "steadier run to run than the raw timings, where one slow "
-                 "keystroke shifts everything after it.",
+                 "typing energy is spread across rhythm frequencies. It is "
+                 "the clearest picture of what a typing rhythm is -- but not "
+                 "what the decision runs on. At ~30 keystrokes these bins are "
+                 "estimated from too few points to be reliable, and measuring "
+                 "it both ways showed the statistics in step 4 identify "
+                 "people better. Shown because it explains the signal.",
             chart=ChartSpec(
                 series=[Series([float(v) for v in dwell_feat["magnitude"]],
                                "|dwell|", SERIES_1),
@@ -179,32 +170,34 @@ def build_phases(sample, enrolled, pipeline):
         Phase(
             key="features",
             title="4 - feature vector",
-            lead="Each spectrum is summarised into five numbers, and four "
-                 "plain time-domain statistics are added: 14 numbers that "
-                 "stand in for this sample from here on. They are deliberately "
-                 "not plotted together -- centroids, energy ratios and "
-                 "milliseconds share no axis.",
-            rows=[(FEATURE_NAMES[i][0], f"{vector[i]:.4f}")
+            lead=f"{len(vector)} numbers stand in for this sample from here "
+                 f"on: robust descriptors of both timing streams (medians and "
+                 f"spreads, which one think-pause cannot move), how often the "
+                 f"next key goes down before the last comes up, how the "
+                 f"spacebar is held against the letters, and speed. They are "
+                 f"deliberately not plotted together -- fractions, ratios and "
+                 f"milliseconds share no axis.",
+            rows=[(feature_names[i][0], f"{vector[i]:.4f}")
                   for i in range(len(vector))],
-            rows_title="the 14 features",
-            footnote="fft_features.feature_vector",
+            rows_title=f"the {len(vector)} features",
+            footnote="timing_features.feature_vector",
         ),
         Phase(
             key="normalise",
             title="5 - normalise",
-            lead="Those 14 numbers have wildly different scales, so each is "
-                 "z-scored against the enrolled set: zero means exactly "
-                 "average for the enrolled population, +/-1 means one standard "
-                 "deviation away. Only now can they share one axis.",
+            lead=f"Those {len(vector)} numbers have wildly different scales, "
+                 f"so each is z-scored against the enrolled set: zero means "
+                 f"exactly average for the enrolled population, +/-1 means one "
+                 f"standard deviation away. Only now can they share one axis.",
             chart=ChartSpec(
                 kind="diverging",
                 series=[Series([float(v) for v in z], "z-score", SERIES_1)],
-                categories=[short for _, short in FEATURE_NAMES],
+                categories=[short for _, short in feature_names],
                 x_label="feature", y_label="standard deviations from the mean",
                 value_format="{:+.2f}", tick_format="{:g}",
                 hover_format="{index}",
                 annotate_label=f"{z[int(np.argmax(np.abs(z)))]:+.2f}"),
-            rows=[(FEATURE_NAMES[i][0], f"{z[i]:+.2f}")
+            rows=[(feature_names[i][0], f"{z[i]:+.2f}")
                   for i in range(len(z))],
             rows_title="z-scores",
             footnote="classifier.ZScoreScaler",
@@ -213,9 +206,12 @@ def build_phases(sample, enrolled, pipeline):
             key="decide",
             title="6 - decide",
             lead=f"Each enrolled user has a template: the mean of their own "
-                 f"normalised samples. The sample is compared to every "
-                 f"template, and the nearest wins -- but only if it is inside "
-                 f"the accept threshold, otherwise nobody is claimed.",
+                 f"normalised samples, plus how much they personally vary on "
+                 f"each feature. Distance is measured in units of that "
+                 f"variation, so a deviation that is unremarkable in an "
+                 f"erratic typist still counts against a metronomic one. The "
+                 f"nearest template wins -- but only inside the accept "
+                 f"threshold, otherwise nobody is claimed.",
             chart=ChartSpec(
                 kind="hbars",
                 series=[Series([d for _, d in distances], "distance")],
@@ -232,7 +228,7 @@ def build_phases(sample, enrolled, pipeline):
                   ("margin over 2nd", f"{runner_up - closest_dist:.2f}"),
                   ("enrolled users", f"{len(user_ids)}")],
             rows_title="verdict",
-            footnote="classifier.build_templates / knn_predict, "
+            footnote="classifier.build_templates / template_distance, "
                      "identify_sample.identify",
         ),
     ]
