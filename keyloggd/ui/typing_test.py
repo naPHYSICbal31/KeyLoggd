@@ -52,6 +52,15 @@ CARET_BLINK_DELAY_MS = 45
 TYPE_FONT_SIZE = 26       # sized to fit the three-line typing container
 DISPLAY_LINES = 3
 
+# Pace caret: a ghost caret that runs through the words at a target speed,
+# so the typist can see whether they are ahead of it or behind it. Tk has no
+# per-widget alpha, so "mostly transparent grey" is a grey blended most of
+# the way into the background.
+PACE_PRESETS = [0, 40, 60, 80, 100, 120, 150]   # 0 = off
+PACE_MAX_WPM = 300
+PACE_CARET_OPACITY = 0.45  # share of the grey kept over the background
+PACE_FRAME_MS = 16
+
 #: Recorded under this name in the enrollment file. The typing test deals
 #: fresh words every run, so no single phrase describes what was typed --
 #: and nothing downstream reads the phrase, which is the point: the
@@ -398,6 +407,7 @@ class TypingTest(tk.Frame):
         self.punctuation = False
         self.numbers = False
         self.custom_text = ""             # set via the custom-mode dialog
+        self.pace_wpm = 0                 # pace caret speed, 0 = off
 
         self.state = "idle"  # idle -> running -> finished
         self.words = []
@@ -410,6 +420,7 @@ class TypingTest(tk.Frame):
         self.caret_job = None
         self.caret_blink_job = None
         self.caret_retry_job = None
+        self.pace_job = None
         self.caret_visible = True
         self.caret_blink_level = 0
         self.caret_blink_direction = 1
@@ -515,13 +526,24 @@ class TypingTest(tk.Frame):
         self.text.place(relx=0.5, rely=self.text_rely, anchor="center",
                         relwidth=1.0)
         status_row.lift()
+        # the pace control sits opposite the countdown: the controls row
+        # above is already as wide as the embedded view allows
+        self._build_pace_control(mid, bg)
         self.text.tag_configure("correct", foreground=FG_CORRECT)
         self.text.tag_configure("incorrect", foreground=FG_INCORRECT,
                                 underline=True)
         self.text.tag_configure("untyped", foreground=FG_DIM)
         self.text.config(state="disabled")
+        # created before the real caret, so the real one stacks above it
+        # whenever the two share a character
+        self.pace_caret = tk.Frame(
+            self.text, bg=blend(bg, FG_DIM, PACE_CARET_OPACITY),
+            width=CARET_WIDTH, bd=0, highlightthickness=0)
         self.caret = tk.Frame(self.text, bg=ACCENT, width=CARET_WIDTH, bd=0,
                               highlightthickness=0)
+        # clicking the words hands the keyboard back from the pace box
+        self.text.bind("<Button-1>",
+                       lambda e: self.winfo_toplevel().focus_set())
 
         self._build_results()
 
@@ -603,6 +625,73 @@ class TypingTest(tk.Frame):
             export_btn.pack(side="left", padx=6)
             export_btn.bind("<Button-1>", lambda e: self._export_samples())
 
+    def _place_pace_panel(self):
+        self.pace_panel.place(relx=0.985, rely=self.status_rely, anchor="se",
+                              y=-6)
+        # a Canvas's own lift() raises canvas items, not the widget
+        tk.Misc.lift(self.pace_panel)
+
+    def _build_pace_control(self, parent, bg):
+        """The "pace ___ wpm ▾" pill: type a speed, or pick one from the
+        dropdown. Blank or 0 turns the pace caret off."""
+        pace_panel = RoundedPanel(parent, BG_PANEL, radius=6, bg=bg)
+        self.pace_panel = pace_panel
+        self._place_pace_panel()
+        inner = pace_panel.inner
+
+        tk.Label(inner, text="▶ pace", fg=FG_DIM, bg=BG_PANEL,
+                 font=ui(12), padx=6).pack(side="left")
+
+        digits_only = (self.register(
+            lambda s: s == "" or (s.isdigit() and len(s) <= 3)), "%P")
+        self.pace_entry = tk.Entry(
+            inner, width=4, justify="center", bg=BG, fg=ACCENT,
+            insertbackground=ACCENT, font=mono(12), relief="flat", bd=0,
+            highlightthickness=0, validate="key", validatecommand=digits_only)
+        self.pace_entry.pack(side="left", pady=2)
+        for sequence in ("<Return>", "<KP_Enter>", "<Escape>"):
+            self.pace_entry.bind(sequence, self._commit_pace_entry)
+        self.pace_entry.bind("<FocusOut>", self._commit_pace_entry)
+
+        tk.Label(inner, text="wpm", fg=FG_DIM, bg=BG_PANEL, font=ui(12),
+                 padx=4).pack(side="left")
+
+        menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                       activebackground=ACCENT, activeforeground=BG,
+                       font=ui(11), bd=0)
+        for value in PACE_PRESETS:
+            menu.add_command(label="off" if value == 0 else f"{value} wpm",
+                             command=lambda v=value: self._set_pace(v))
+        arrow = tk.Label(inner, text="▾", fg=FG_LABEL, bg=BG_PANEL,
+                         font=ui(12), cursor="hand2", padx=6)
+        arrow.pack(side="left")
+        arrow.bind("<Button-1>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+
+        self._show_pace_value()
+
+    def _show_pace_value(self):
+        self.pace_entry.delete(0, "end")
+        if self.pace_wpm:
+            self.pace_entry.insert(0, str(self.pace_wpm))
+
+    def _commit_pace_entry(self, _event=None):
+        text = self.pace_entry.get().strip()
+        self._set_pace(int(text) if text else 0)
+        if _event is not None and _event.type != tk.EventType.FocusOut:
+            # hand the keyboard back to the test, so the next key types
+            self.winfo_toplevel().focus_set()
+        return "break"
+
+    def _set_pace(self, wpm):
+        wpm = max(0, min(PACE_MAX_WPM, int(wpm)))
+        changed = wpm != self.pace_wpm
+        self.pace_wpm = wpm
+        self._show_pace_value()
+        if changed and self.state == "running":
+            # the pace is measured from the run's start, so switching it on
+            # (or changing it) mid-run jumps to where that pace would be now
+            self._start_pace_caret()
+
     def _stat_block(self, parent, caption, font, colour):
         """One caption-over-value stat in the results column."""
         tk.Label(parent, text=caption, fg=FG_LABEL, bg=BG_PANEL,
@@ -642,6 +731,7 @@ class TypingTest(tk.Frame):
         toplevel = self.winfo_toplevel()
         if active:
             self.controls_frame.place_forget()
+            self.pace_panel.place_forget()
             if self.bottom_frame is not None:
                 self.bottom_frame.place_forget()
             self.text.configure(cursor="none")
@@ -649,6 +739,8 @@ class TypingTest(tk.Frame):
         else:
             self.controls_frame.place(relx=0.5, rely=self.controls_rely,
                                       anchor="n")
+            if self.state != "finished":
+                self._place_pace_panel()
             if self.bottom_frame is not None:
                 self.bottom_frame.place(**self.bottom_place)
             self.text.configure(cursor="arrow")
@@ -823,11 +915,12 @@ class TypingTest(tk.Frame):
     # ------------------------------------------------------------------
     def _cancel_jobs(self):
         for attr in ("timer_job", "caret_job", "caret_blink_job",
-                     "caret_retry_job"):
+                     "caret_retry_job", "pace_job"):
             job = getattr(self, attr)
             if job is not None:
                 self.after_cancel(job)
                 setattr(self, attr, None)
+        self.pace_caret.place_forget()
 
     def _new_test(self):
         self._cancel_jobs()
@@ -875,6 +968,7 @@ class TypingTest(tk.Frame):
         self.status_row.place(relx=.015, rely=self.status_rely, anchor="sw")
         self.text.place(relx=0.5, rely=self.text_rely, anchor="center",
                         relwidth=1.0)
+        self._place_pace_panel()
 
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
@@ -900,6 +994,7 @@ class TypingTest(tk.Frame):
             self.start_perf = time.perf_counter()
             self.session_perf0 = self.start_perf
             self._tick_timer()
+            self._start_pace_caret()
 
     def _tick_timer(self):
         if self.state != "running":
@@ -974,6 +1069,7 @@ class TypingTest(tk.Frame):
         self.text.place_forget()
         # the countdown would otherwise show through the widened results panel
         self.status_row.place_forget()
+        self.pace_panel.place_forget()
         self.wpm_label.config(text=f"{wpm:.0f}")
         self.acc_label.config(text=f"{accuracy:.1f}%")
         self.chars_label.config(text=str(total_typed))
@@ -1063,6 +1159,54 @@ class TypingTest(tk.Frame):
             lambda: self._animate_caret(old_position, target_position, step + 1),
         )
 
+    # ------------------------------------------------------------------
+    # Pace caret
+    # ------------------------------------------------------------------
+    def _start_pace_caret(self):
+        if self.pace_job is not None:
+            self.after_cancel(self.pace_job)
+            self.pace_job = None
+        self._pace_tick()
+
+    def _pace_tick(self):
+        """Put the ghost caret where a typist at pace_wpm would be by now.
+
+        Driven from the clock rather than stepped a character per frame, so
+        it cannot drift, and interpolated within a character so it glides
+        instead of ticking. One bbox pair and a place() per frame is cheap
+        enough to leave the keystroke timestamps alone.
+        """
+        self.pace_job = None
+        if self.state != "running" or not self.pace_wpm:
+            self.pace_caret.place_forget()
+            return
+
+        elapsed = time.perf_counter() - self.start_perf
+        chars = elapsed * self.pace_wpm * 5.0 / 60.0
+        if chars >= len(self.full_text):
+            # the pace finished the text: park on the last character's end
+            chars = len(self.full_text) - 1e-6
+        index = int(chars)
+        frac = chars - index
+
+        box = self.text.bbox(f"1.0+{index}c")
+        if box is None:
+            # scrolled out of view (behind, above the visible lines, or ahead
+            # of them) -- nothing to point at until it comes back into view
+            self.pace_caret.place_forget()
+        else:
+            x, y, width, height = box
+            nxt = self.text.bbox(f"1.0+{index + 1}c")
+            if nxt is not None and nxt[1] == y:
+                x += (nxt[0] - x) * frac
+            else:
+                x += width * frac   # last character on its display line
+            self.pace_caret.place(x=int(x + CARET_X_OFFSET),
+                                  y=y + CARET_Y_OFFSET, width=CARET_WIDTH,
+                                  height=height)
+
+        self.pace_job = self.after(PACE_FRAME_MS, self._pace_tick)
+
     def _schedule_caret_blink(self):
         if self.state != "idle":
             return
@@ -1103,8 +1247,14 @@ class TypingTest(tk.Frame):
     def _printable_or_space(keysym, char):
         return (len(char) == 1 and char.isprintable()) or keysym == "space"
 
+    def _pace_box_has_focus(self):
+        try:
+            return self.focus_get() is self.pace_entry
+        except (KeyError, tk.TclError):   # focus inside a popup menu
+            return False
+
     def handle_keypress(self, event):
-        if not self.active:
+        if not self.active or self._pace_box_has_focus():
             return None
         keysym, char = event.keysym, event.char
 
@@ -1184,7 +1334,7 @@ class TypingTest(tk.Frame):
         return None
 
     def handle_keyrelease(self, event):
-        if not self.active:
+        if not self.active or self._pace_box_has_focus():
             return None
         keysym, char = event.keysym, event.char
         if keysym == "BackSpace" or not self._printable_or_space(keysym, char):

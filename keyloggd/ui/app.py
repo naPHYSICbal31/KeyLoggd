@@ -18,18 +18,20 @@ Three views:
 
                 {"user_id": ..., "phrase": ..., "samples": [{"events": [...]}]}
 
-  identify  Type a phrase (or load a JSON file) and run it through the real
-            pipeline -- signal_construction -> fft_features -> classifier /
-            identify_sample -- to answer "whose typing behaviour is this?",
-            including the open-set UNRECOGNIZED decision.
+  identify  The same typing test (or a loaded JSON file), run through the
+            real pipeline -- signal_construction -> fft_features ->
+            classifier / identify_sample -- to answer "whose typing behaviour
+            is this?", including the open-set UNRECOGNIZED decision. A run
+            that no enrolled typist passes the threshold on deals a fresh
+            test, so the typist keeps typing until they are recognised.
 
   explain   The same pipeline, one phase at a time, with the real intermediate
             numbers charted at each step: raw dwell/flight, zero-padding, the
             FFT magnitude spectrum, the 14-number feature vector, z-scores,
             and the distance-to-template decision (see ui.explain).
 
-Identify and explain still type a fixed phrase: both are answering a question
-about one attempt, where holding the text constant is the point.
+Explain still types a fixed phrase: it walks through one attempt, where
+holding the text constant is the point.
 
 The heavy numpy work (dataset build, EER threshold sweep) happens on a worker
 thread so the UI never blocks; results come back through a queue that the Tk
@@ -623,6 +625,22 @@ def sample_stats(sample):
     }
 
 
+def run_stats(samples, summary):
+    """Dwell/flight summary pooled over every sample of a typing test run,
+    with the run's own wpm (the samples are cut from it, so their timestamps
+    alone would miss the gaps between them)."""
+    dwell, flight = [], []
+    for sample in samples:
+        stats = sample_stats(sample)
+        dwell.extend(stats["dwell"])
+        flight.extend(stats["flight"])
+    return {
+        "mean_dwell": sum(dwell) / len(dwell) if dwell else 0.0,
+        "mean_flight": sum(flight) / len(flight) if flight else 0.0,
+        "wpm": summary["wpm"],
+    }
+
+
 class SignalStrip(tk.Canvas):
     """Bar plot of the last sample's dwell and flight signals.
 
@@ -1074,6 +1092,14 @@ class CaptureToolApp:
     # -- identify view ------------------------------------------------------
 
     def _build_identify_view(self, parent):
+        """Identification: the same typing test as enroll, run until someone
+        is recognised.
+
+        A finished run is cut into samples and matched as one fused verdict.
+        If no enrolled template is inside the accept threshold -- or the run
+        was too short to cut a sample from -- a fresh test is dealt straight
+        away, so the typist just keeps typing until the answer is in.
+        """
         view = tk.Frame(parent, bg=BG)
 
         top = tk.Frame(view, bg=BG)
@@ -1087,15 +1113,25 @@ class CaptureToolApp:
         PillButton(top, "identify from file...", self._identify_from_file,
                    size=10, bg=BG, padx=13, pady=6).pack(side="right", padx=10)
 
-        bar, self.identify_counter, self.identify_status = self._phrase_bar(view)
-        bar.pack(fill="x", pady=(20, 4))
+        status_row = tk.Frame(view, bg=BG)
+        status_row.pack(fill="x", pady=(8, 0))
+        self.identify_status = tk.Label(status_row, text="", fg=FG_DIM, bg=BG,
+                                        font=ui(10))
+        self.identify_status.pack(side="left")
 
-        type_wrap, self.identify_capture = self._typing_card(
-            view, self._on_identify_sample, self._on_identify_progress)
-        type_wrap.pack(fill="x", pady=(6, 20))
+        # the typing test, as the identification input
+        type_wrap = tk.Frame(view, bg=BG)
+        type_wrap.pack(fill="both", expand=True, pady=(8, 16))
+        self.identify_capture = TypingTest(
+            type_wrap, on_finish=self._on_identify_test_finish,
+            on_typing_start=self._settle_chrome_animations, embedded=True)
+        self.identify_capture.pack(fill="both", expand=True)
 
-        lower = tk.Frame(view, bg=BG)
-        lower.pack(fill="both", expand=True)
+        lower = tk.Frame(view, bg=BG, height=self.IDENTIFY_LOWER_HEIGHT)
+        lower.pack(fill="x")
+        # as in enroll, the typing test absorbs a resize, not the verdict
+        lower.pack_propagate(False)
+        lower.grid_propagate(False)
         lower.columnconfigure(0, weight=3, uniform="cols")
         lower.columnconfigure(1, weight=4, uniform="cols")
         lower.rowconfigure(0, weight=1)
@@ -1103,17 +1139,18 @@ class CaptureToolApp:
         verdict_wrap, verdict_panel = self._labelled_panel(lower, "verdict")
         verdict_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         self.verdict_label = tk.Label(verdict_panel, text="—", fg=FG_DIM,
-                                      bg=BG_PANEL, font=ui(34, bold=True))
-        self.verdict_label.pack(pady=(26, 4), padx=16)
+                                      bg=BG_PANEL, font=ui(28, bold=True))
+        self.verdict_label.pack(pady=(12, 2), padx=16)
         self.verdict_sub = tk.Label(
-            verdict_panel, text="type the phrase above to identify a typist",
-            fg=FG_DIM, bg=BG_PANEL, font=ui(10), wraplength=280,
+            verdict_panel, text="finish a typing test above to identify the "
+                                "typist",
+            fg=FG_DIM, bg=BG_PANEL, font=ui(10), wraplength=300,
             justify="center")
-        self.verdict_sub.pack(pady=(0, 10), padx=16)
+        self.verdict_sub.pack(pady=(0, 8), padx=16)
         self.verdict_detail = tk.Label(
             verdict_panel, text="", fg=FG_LABEL, bg=BG_PANEL, font=mono(10),
             justify="left", anchor="w")
-        self.verdict_detail.pack(pady=(0, 18), padx=18, fill="x")
+        self.verdict_detail.pack(pady=(0, 10), padx=18, fill="x")
 
         dist_wrap, dist_panel = self._labelled_panel(
             lower, "distance to enrolled templates")
@@ -1121,7 +1158,7 @@ class CaptureToolApp:
         self.distance_bars = DistanceBars(dist_panel)
         self.distance_bars.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.identify_blocks = [top, bar, type_wrap, lower]
+        self.identify_blocks = [top, status_row, type_wrap, lower]
         return view
 
     # -- explain view -------------------------------------------------------
@@ -1155,6 +1192,7 @@ class CaptureToolApp:
     # ------------------------------------------------------------------
 
     ENROLL_LOWER_HEIGHT = 168   # px kept for the session list / signal strip
+    IDENTIFY_LOWER_HEIGHT = 214  # px kept for the verdict / distance bars
     APPEAR_STAGGER_MS = 65
 
     def _snapshot_fade_targets(self):
@@ -1241,13 +1279,15 @@ class CaptureToolApp:
             self.hint_label.configure(
                 text="just type - a finished test becomes several samples   "
                      "|   tab: new test   |   esc: stop early")
-        else:
-            action = ("identify the typist" if name == "identify"
-                      else "walk through the pipeline")
+        elif name == "identify":
             self.hint_label.configure(
-                text=f"type the phrase to {action}   |   backspace: undo a "
-                     "keystroke   |   esc: restart the phrase   |   enter: "
-                     "submit")
+                text="just type - keep going until a typist is recognised   "
+                     "|   tab: new test   |   esc: stop early")
+        else:
+            self.hint_label.configure(
+                text="type the phrase to walk through the pipeline   |   "
+                     "backspace: undo a keystroke   |   esc: restart the "
+                     "phrase   |   enter: submit")
 
         if (name in ("identify", "explain") and self.enrolled is None
                 and not self.loading):
@@ -1257,12 +1297,10 @@ class CaptureToolApp:
         self.phrase_index = index % len(PHRASES)
         phrase = PHRASES[self.phrase_index]
         counter_text = f"phrase {self.phrase_index + 1}/{len(PHRASES)}"
-        # enroll deals its own words in the typing test, so only the two
-        # phrase-at-a-time views follow the picker
-        for capture, counter in ((self.identify_capture, self.identify_counter),
-                                 (self.explain_capture, self.explain_counter)):
-            capture.set_phrase(phrase)
-            counter.configure(text=counter_text)
+        # enroll and identify deal their own words in the typing test, so
+        # only the phrase-at-a-time explain view follows the picker
+        self.explain_capture.set_phrase(phrase)
+        self.explain_counter.configure(text=counter_text)
 
     def _step_phrase(self, delta):
         self._set_phrase(self.phrase_index + delta)
@@ -1496,42 +1534,50 @@ class CaptureToolApp:
     # Identify view behaviour
     # ------------------------------------------------------------------
 
-    # Why an attempt was thrown away. Only the phrase-at-a-time views can
-    # reject one: the typing test scores what was typed rather than demanding
-    # an exact match, so a typo there is data like any other.
+    # Why an attempt was thrown away. Only the phrase-at-a-time explain view
+    # can reject one: the typing test scores what was typed rather than
+    # demanding an exact match, so a typo there is data like any other.
     REJECT_MESSAGES = {
         "mismatch": "that did not match the phrase exactly - retyped from scratch",
         "untracked": "could not track that input reliably - retyped from scratch",
     }
 
-    def _on_identify_progress(self, pos, total):
-        if pos == 0:
-            self._status(self.identify_status,
-                         "type the phrase to identify the typist", FG_DIM)
-        else:
-            self.identify_status.configure(text=f"{pos}/{total} characters",
-                                           fg=FG_LABEL)
+    def _retry_identify_test(self):
+        """Deal a fresh test for another try -- unless the typist has already
+        started one, which a late verdict must not wipe."""
+        if self.identify_capture.state == "finished":
+            self.identify_capture.reset()
 
-    def _on_identify_sample(self, sample, status):
-        if sample is None:
+    def _on_identify_test_finish(self, samples, summary):
+        """Match a finished typing test against the enrolled users.
+
+        The whole run is scored as one fused verdict. When it does not land
+        inside the accept threshold, _apply_identification deals a new test,
+        so identification is simply: keep typing until someone is recognised.
+        """
+        if not samples:
             self._status(self.identify_status,
-                         self.REJECT_MESSAGES.get(status, "attempt discarded"),
-                         FG_INCORRECT)
-            self.identify_capture.flash_reject()
+                         "too short to identify - a sample needs at least "
+                         f"{MIN_KEYS} keystrokes, keep typing", FG_INCORRECT)
+            self._retry_identify_test()
             return
         if self.enrolled is None:
             self._status(self.identify_status,
-                         "enrolled set still loading - try again in a moment",
+                         "enrolled set still loading - type again in a moment",
                          WARN)
             if not self.loading:
                 self._load_enrolled()
+            self._retry_identify_test()
             return
 
+        plural = "" if len(samples) == 1 else "s"
         self._status(self.identify_status,
-                     "matching against enrolled users...", FG_LABEL)
+                     f"matching {len(samples)} sample{plural} against "
+                     "enrolled users...", FG_LABEL)
+        self.identify_capture.set_result_note("identifying...")
         self._set_verdict("...", "running the pipeline", FG_LABEL)
-        self.attempt_stats = sample_stats(sample)
-        self._submit_job("identify", self._job_identify, [sample])
+        self.attempt_stats = run_stats(samples, summary)
+        self._submit_job("identify", self._job_identify, samples)
 
     def _identify_from_file(self):
         path = filedialog.askopenfilename(
@@ -1696,7 +1742,8 @@ class CaptureToolApp:
                 elif kind == "explain":
                     self._apply_explain(result)
                 else:
-                    self._apply_identification(result)
+                    self._apply_identification(
+                        result, from_typing_test=kind == "identify")
         except queue.Empty:
             pass
         self.root.after(120, self._poll_worker)
@@ -1710,6 +1757,8 @@ class CaptureToolApp:
                          f"could not load enrolled set: {error}", FG_INCORRECT)
         else:
             self._set_verdict("error", str(error), FG_INCORRECT)
+            if kind == "identify":
+                self._retry_identify_test()
         self._status(self.identify_status, str(error), FG_INCORRECT)
 
     def _apply_enrolled(self, result):
@@ -1726,9 +1775,9 @@ class CaptureToolApp:
              f"(EER {result['eer'] * 100:.1f}%)"),
             FG_LABEL)
         self._status(self.identify_status,
-                     "ready - type the phrase to identify the typist", FG_DIM)
+                     "ready - start typing to identify the typist", FG_DIM)
 
-    def _apply_identification(self, results):
+    def _apply_identification(self, results, from_typing_test=False):
         p = self.pipeline
         unrecognized = p["UNRECOGNIZED"]
 
@@ -1753,21 +1802,32 @@ class CaptureToolApp:
 
         confidence = ("high" if first["margin"] > 1.0 else
                       "moderate" if first["margin"] > 0.4 else "low")
-        detail = (f"knn vote (k=3)    {first['knn_vote']}\n"
-                  f"margin over 2nd   {first['margin']:.2f}  ({confidence})\n"
+        detail = (f"margin over 2nd   {first['margin']:.2f}  ({confidence})\n"
                   f"samples scored    {len(results)}")
         if self.attempt_stats:
             a = self.attempt_stats
-            detail += (f"\n\nthis attempt\n"
-                       f"  mean dwell      {a['mean_dwell']:.0f} ms\n"
-                       f"  mean flight     {a['mean_flight']:.0f} ms\n"
-                       f"  speed           {a['wpm']:.0f} wpm")
+            detail += (f"\nthis run          {a['wpm']:.0f} wpm\n"
+                       f"dwell / flight    {a['mean_dwell']:.0f} / "
+                       f"{a['mean_flight']:.0f} ms")
 
         self._set_verdict(headline, sub, colour, detail)
         self.distance_bars.show(first["ranked_distances"], self.threshold,
                                 first["closest_template"] if accepted else None)
-        self._status(self.identify_status, "identification complete",
-                     OK if accepted else FG_INCORRECT)
+
+        if not from_typing_test:
+            self._status(self.identify_status, "identification complete",
+                         OK if accepted else FG_INCORRECT)
+        elif accepted:
+            self._status(self.identify_status,
+                         f"recognised as {overall} - tab for another test",
+                         OK)
+            self.identify_capture.set_result_note(f"recognised: {overall}")
+        else:
+            # nobody inside the threshold yet: straight into another test
+            self._status(self.identify_status,
+                         "no enrolled typist passed the threshold - "
+                         "type again", FG_INCORRECT)
+            self._retry_identify_test()
 
 
 def parse_args(argv=None):
