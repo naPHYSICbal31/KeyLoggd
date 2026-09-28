@@ -1,0 +1,8 @@
+# XeLaTeX build by-products; keyloggd.tex is the source, keyloggd.pdf the output
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.vrb

@@ -46,32 +46,34 @@ UNRECOGNIZED = "UNRECOGNIZED"
 
 #: How far past the EER point to put the accept threshold.
 #:
-#: The equal-error point is where false accepts and false rejects are equally
-#: likely. That is the right place to *report* a system's quality from, but it
-#: is a needlessly strict place to run one: it treats turning away the
-#: enrolled user as exactly as costly as admitting a stranger, and for this
-#: tool -- which identifies rather than guards anything -- being turned away
-#: is the more annoying failure by a wide margin.
+#: Chosen to minimise the half total error rate, HTER = (FAR + FRR) / 2:
+#: the operating point that makes the fewest mistakes overall, counting a
+#: stranger let in and an enrolled user turned away as equally bad.
 #:
 #: Measured on the cross-phrase benchmark (8 users), as a multiple of the
-#: EER threshold:
+#: EER threshold, with the real enrolled set alongside:
 #:
-#:     x1.00   genuine rejected  5.8%   impostor accepted   6.1%
-#:     x1.15   genuine rejected  2.9%   impostor accepted  10.1%
-#:     x1.20   genuine rejected  2.5%   impostor accepted  11.7%
-#:     x1.30   genuine rejected  0.8%   impostor accepted  14.5%
+#:              benchmark                      real set (6 users)
+#:             rejected  accepted  HTER       rejected  accepted  HTER
+#:     x1.00      5.8%      6.1%   5.95%        18.8%     19.2%  18.96%
+#:     x1.05      5.0%      7.3%   6.13%        12.5%     22.1%  17.29%
+#:     x1.20      2.5%     11.7%   7.11%         8.3%     29.6%  18.96%
+#:     x1.30      0.8%     14.5%   7.68%         6.2%     36.7%  21.46%
 #:
-#: 1.20 cuts the false rejections to well under half for a few points of
-#: false accepts. It is also where the real enrolled set here stops turning
-#: away one of its own samples, while 1.15 changed nothing on it -- the two
-#: are within noise of each other on the benchmark, so the real data broke
-#: the tie.
+#: The exact benchmark optimum is x1.06, so 1.05 sits on it, and it also
+#: beats both 1.00 and 1.20 on the real set. The real set's own minimum
+#: (x0.77) is not used: it rests on 48 genuine scores and lies at the edge
+#: of the sweep, so it would be tuning to noise.
+#:
+#: This used to be 1.20, which deliberately traded false accepts for fewer
+#: false rejects. If turning the enrolled user away matters more than
+#: letting a stranger in, raise it again; that is a policy choice, not a
+#: more accurate one.
 #:
 #: The threshold only decides whether the closest template is close *enough*,
 #: never which one is closest, so moving it cannot change who a sample is
-#: identified as -- only whether the answer is given at all. Raise it to be
-#: more forgiving, lower it toward 1.0 to be stricter.
-ACCEPT_TOLERANCE = 1.20
+#: identified as -- only whether the answer is given at all.
+ACCEPT_TOLERANCE = 1.05
 
 DEFAULT_DATA_DIR = SYNTHETIC_DIR
 
